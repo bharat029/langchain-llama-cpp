@@ -67,6 +67,10 @@ ban-relative-imports = "all"
 ]
 "notebooks/**" = ["T201", "D", "INP001", "ANN"]
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"  # the langchain-tests async tests aren't marked
+asyncio_default_fixture_loop_scope = "function"
+
 # Pyright is the engine inside Pylance, so VS Code and `uv run pyright` agree.
 [tool.pyright]
 include = ["src", "tests"]

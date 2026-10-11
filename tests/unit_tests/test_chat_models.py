@@ -1119,3 +1119,107 @@ def test_agent_loop_sends_the_tool_call_and_result_back() -> None:
         },
     ]
     assert server.bodies[1]["tools"] == [WEATHER_TOOL]
+
+
+# --- v1 content blocks while streaming ---------------------------------------
+
+
+def tool_call_delta(
+    index: int, *, call_id: str | None = None, name: str | None = None, args: str = ""
+) -> dict[str, Any]:
+    function: dict[str, Any] = {"arguments": args}
+    if name is not None:
+        function["name"] = name
+    call: dict[str, Any] = {"index": index, "function": function}
+    if call_id is not None:
+        call |= {"id": call_id, "type": "function"}
+    return delta(tool_calls=[call])
+
+
+def stream_v1(*events: dict[str, Any]) -> AIMessageChunk:
+    llm = make_llm(Server(sse(*events)), output_version="v1")
+    return merge(list(llm.stream("hi")))
+
+
+MAGIC_CALL = {
+    "type": "tool_call",
+    "name": "magic_function",
+    "args": {"input": 3},
+    "id": "call_1",
+}
+
+
+def test_v1_stream_keeps_a_tool_call_after_reasoning() -> None:
+    msg = stream_v1(
+        delta(role="assistant", content=None),
+        delta(reasoning_content="Use"),
+        delta(reasoning_content=" the tool."),
+        tool_call_delta(0, call_id="call_1", name="magic_function"),
+        tool_call_delta(0, args='{"input": 3}'),
+        delta(finish_reason="tool_calls"),
+    )
+    assert msg.content == [
+        {"type": "reasoning", "reasoning": "Use the tool.", "index": "lc_rs"},
+        MAGIC_CALL,
+    ]
+    assert msg.content_blocks == msg.content
+
+
+def test_v1_stream_keeps_a_tool_call_after_text() -> None:
+    msg = stream_v1(
+        delta(content="Let me"),
+        delta(content=" check."),
+        tool_call_delta(0, call_id="call_1", name="magic_function"),
+        tool_call_delta(0, args='{"input": 3}'),
+        delta(finish_reason="tool_calls"),
+    )
+    assert msg.content == [
+        {"type": "text", "text": "Let me check.", "index": "lc_txt"},
+        MAGIC_CALL,
+    ]
+
+
+def test_v1_stream_keeps_parallel_tool_calls_apart() -> None:
+    msg = stream_v1(
+        delta(reasoning_content="Both."),
+        tool_call_delta(0, call_id="call_1", name="get_weather"),
+        tool_call_delta(0, args='{"city": "Paris"}'),
+        tool_call_delta(1, call_id="call_2", name="get_time"),
+        tool_call_delta(1, args='{"city": "Paris"}'),
+        delta(finish_reason="tool_calls"),
+    )
+    assert [block["type"] for block in msg.content_blocks] == [
+        "reasoning",
+        "tool_call",
+        "tool_call",
+    ]
+    assert [call["name"] for call in msg.tool_calls] == ["get_weather", "get_time"]
+
+
+def test_v1_astream_keeps_a_tool_call_after_reasoning() -> None:
+    llm = make_llm(
+        Server(
+            sse(
+                delta(reasoning_content="Use the tool."),
+                tool_call_delta(0, call_id="call_1", name="magic_function"),
+                tool_call_delta(0, args='{"input": 3}'),
+                delta(finish_reason="tool_calls"),
+            )
+        ),
+        output_version="v1",
+    )
+
+    async def collect() -> list[AIMessageChunk]:
+        return [chunk async for chunk in llm.astream("hi")]
+
+    msg = merge(asyncio.run(collect()))
+    assert [block["type"] for block in msg.content_blocks] == ["reasoning", "tool_call"]
+
+
+def test_v0_content_blocks_are_core_defaults() -> None:
+    msg = make_llm(Server(tool_call_reply('{"age": 24}'))).invoke("x")
+    assert msg.response_metadata["model_provider"] == "llama-cpp"
+    assert msg.content_blocks == [
+        {"type": "reasoning", "reasoning": "2 years is 24 months."},
+        {"type": "tool_call", "id": "call_1", "name": "Age", "args": {"age": 24}},
+    ]

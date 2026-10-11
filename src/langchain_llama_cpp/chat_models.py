@@ -65,6 +65,7 @@ from langchain_core.utils.function_calling import (
 from langchain_core.utils.pydantic import is_basemodel_subclass
 from pydantic import BaseModel, Field, PrivateAttr
 
+from langchain_llama_cpp.content_blocks import MODEL_PROVIDER
 from langchain_llama_cpp.exceptions import (
     error_from_response,
     error_from_stream_event,
@@ -72,7 +73,7 @@ from langchain_llama_cpp.exceptions import (
 )
 
 CHAT_COMPLETIONS = "/v1/chat/completions"
-MODEL_PROVIDER = "llama-cpp"
+
 
 # Backoff between retries, as in the openai and groq SDKs.
 INITIAL_RETRY_DELAY = 0.5
@@ -504,6 +505,14 @@ class ChatLlama(BaseChatModel):
                 `"required"`: the server can't force one particular tool (it
                 turns the object form into `"auto"`), so the model must call a
                 tool but may pick another one. `None` and `False` leave it out.
+
+                How strictly `"required"` holds depends on the chat handler
+                llama-server picks for the model's template. For Qwen3.5/3.6
+                (the handler llama.cpp names "qwen3-coder") the grammar lets
+                the model write text before the call and forbids ending without
+                one, so a model that doesn't want a tool keeps writing until
+                `max_tokens`, with no tool call (llama.cpp issue #27217, open
+                as of b11429). Keep `max_tokens` set when forcing tools.
             strict: Sent as `strict` on each tool when set. llama-server
                 ignores it: its grammar always enforces the schema.
             parallel_tool_calls: Sent when set.
@@ -551,7 +560,9 @@ class ChatLlama(BaseChatModel):
                   sent with `tool_choice: "required"` and
                   `parallel_tool_calls: false`. The chat template shows the
                   schema (with its descriptions) to the model, and the
-                  server's grammar constrains the arguments.
+                  server's grammar constrains the arguments. With Qwen3.5/3.6,
+                  a prompt the model doesn't answer with the tool runs to
+                  `max_tokens` (see `bind_tools`).
                 - `"json_schema"`: `response_format: {"type": "json_schema"}`.
                   Grammar only: the model never sees the schema or its
                   descriptions unless `include_format_instructions=True`.
