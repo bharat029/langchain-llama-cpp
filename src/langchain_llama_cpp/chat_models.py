@@ -4,7 +4,7 @@ import asyncio
 import json
 import random
 import time
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from operator import itemgetter
 from typing import Any, Literal, cast
 
@@ -55,6 +55,7 @@ from langchain_core.runnables import (
     RunnableMap,
     RunnablePassthrough,
 )
+from langchain_core.tools import BaseTool
 from langchain_core.utils import from_env
 from langchain_core.utils.function_calling import (
     convert_to_json_schema,
@@ -481,6 +482,52 @@ class ChatLlama(BaseChatModel):
         defaults["n_ctx"] = settings.get("n_ctx")
         return defaults
 
+    def bind_tools(
+        self,
+        tools: Sequence[dict[str, Any] | type | Callable[..., Any] | BaseTool],
+        *,
+        tool_choice: dict[str, Any] | str | bool | None = None,
+        strict: bool | None = None,
+        parallel_tool_calls: bool | None = None,
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, AIMessage]:
+        """Bind tools to the model, sent as OpenAI-format `tools`.
+
+        Args:
+            tools: Anything `convert_to_openai_tool` accepts: `@tool` functions,
+                `BaseTool`s, Pydantic classes, `TypedDict`s, plain functions or
+                OpenAI tool dicts.
+            tool_choice: llama-server accepts only the strings `"auto"`,
+                `"none"` and `"required"`, which are sent as they are.
+                `"any"` and `True` become `"required"`. A bound tool's name, or
+                `{"type": "function", "function": {"name": ...}}`, also becomes
+                `"required"`: the server can't force one particular tool (it
+                turns the object form into `"auto"`), so the model must call a
+                tool but may pick another one. `None` and `False` leave it out.
+            strict: Sent as `strict` on each tool when set. llama-server
+                ignores it: its grammar always enforces the schema.
+            parallel_tool_calls: Sent when set.
+            **kwargs: Passed through to the request, like `bind`.
+
+        Returns:
+            A runnable that takes the model's input and returns an `AIMessage`.
+
+        Raises:
+            ValueError: If `tool_choice` names a tool that isn't bound, or isn't
+                a value described above.
+        """
+        formatted_tools = [
+            convert_to_openai_tool(tool, strict=strict) for tool in tools
+        ]
+        if tool_choice is not None and tool_choice is not False:
+            tool_names = [tool["function"]["name"] for tool in formatted_tools]
+            kwargs["tool_choice"] = _tool_choice(
+                tool_choice=tool_choice, tool_names=tool_names
+            )
+        if parallel_tool_calls is not None:
+            kwargs["parallel_tool_calls"] = parallel_tool_calls
+        return self.bind(tools=formatted_tools, **kwargs)
+
     def with_structured_output(
         self,
         schema: dict[str, Any] | type | None = None,
@@ -561,8 +608,8 @@ class ChatLlama(BaseChatModel):
         output_parser: Runnable[Any, Any]
         if schema is not None and method == "function_calling":
             tool = convert_to_openai_tool(schema, strict=strict)
-            llm = self.bind(
-                tools=[tool],
+            llm = self.bind_tools(
+                [tool],
                 tool_choice="required",
                 parallel_tool_calls=False,
                 ls_structured_output_format=ls_format,
@@ -767,6 +814,32 @@ def request_field_names() -> list[str]:
         for name in ChatLlama.model_fields
         if name not in inherited and name not in _CLIENT_FIELDS
     ]
+
+
+def _tool_choice(
+    *, tool_choice: dict[str, Any] | str | bool, tool_names: list[str]
+) -> str:
+    """Map a LangChain `tool_choice` to one of the strings llama-server accepts.
+
+    A named tool becomes `"required"`: llama-server turns the object form into
+    `"auto"` (b11429), so `"required"` is the closest it can do.
+    """
+    if tool_choice is True or tool_choice == "any":
+        return "required"
+    if isinstance(tool_choice, str) and tool_choice in {"auto", "none", "required"}:
+        return tool_choice
+    name: object = tool_choice
+    if isinstance(tool_choice, dict):
+        function: object = tool_choice.get("function")
+        if isinstance(function, dict):
+            name = cast("dict[str, Any]", function).get("name")
+    if isinstance(name, str) and name in tool_names:
+        return "required"
+    msg = (
+        "tool_choice must be 'auto', 'none', 'required', 'any', True, or the "
+        f"name of a bound tool ({', '.join(tool_names)}); got {tool_choice!r}"
+    )
+    raise ValueError(msg)
 
 
 def _json_schema_response_format(

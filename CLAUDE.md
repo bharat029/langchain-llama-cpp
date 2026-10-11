@@ -27,6 +27,8 @@ A LangChain chat model (`ChatLlama`) for llama.cpp's `llama-server`, used direct
   - Unknown fields are silently ignored (HTTP 200).
   - `max_tokens` or `max_completion_tokens` both work.
 - **`tool_choice`:** strings only, `auto`/`none`/`required`. An object logs "Wrong type supplied for parameter 'tool_choice'" and falls back to `auto`. With `none`, the model still sees the tools and may write a call as plain text.
+  - **Decision (M4):** `bind_tools` sends `auto`/`none`/`required` as they are; `"any"`, `True`, a bound tool's name and the `{"type":"function","function":{"name"}}` object all become `"required"`, with every bound tool still sent. Forcing one particular tool is the server's job, not ours. **Revisit when the server build changes:** if llama-server starts honouring the object form, send it instead (`_tool_choice` in `chat_models.py`).
+  - Probed 2026-10-11 on gemma, `required` with `test_tool_choice`'s two tools: "Hello!" gave `magic_function` 10/10 in either list order (the reasoning said no tool was needed; the grammar forced a call with throwaway input). "What's the weather in Paris?" gave `get_weather` 5/5, so a named `magic_function` would not be honoured there.
 - **`response_format`:** `json_object` or `json_schema` (`{"type":"json_schema","json_schema":{"name","schema","strict"}}`).
   - It's **grammar-only**: the schema and its descriptions never reach the prompt.
   - Enforced: integer bounds, string length/pattern/format, array length, enum/const, required, additionalProperties.

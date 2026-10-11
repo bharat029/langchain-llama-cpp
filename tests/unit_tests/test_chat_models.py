@@ -14,6 +14,7 @@ from langchain_core.exceptions import (
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
+    BaseMessage,
     HumanMessage,
     SystemMessage,
     ToolMessage,
@@ -22,6 +23,7 @@ from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.output_parsers.format_instructions import (
     JSON_FORMAT_INSTRUCTIONS,
 )
+from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
@@ -965,3 +967,155 @@ def test_structured_ainvoke() -> None:
     )
     assert asyncio.run(structured.ainvoke("Alice is 2.")) == Age(age=2)
     assert server.bodies[0]["messages"][0]["role"] == "system"
+
+
+# --- tools -----------------------------------------------------------------
+
+
+@tool
+def get_weather(city: str) -> str:
+    """Get the current weather for a city."""
+    return f"18C and sunny in {city}"
+
+
+@tool
+def get_time(city: str) -> str:
+    """Get the local time in a city."""
+    return "09:00"
+
+
+WEATHER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+            "type": "object",
+        },
+    },
+}
+
+
+def weather_call_reply(call_id: str = "call_1") -> httpx.Response:
+    return reply_with(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": '{"city":"Paris"}',
+                    },
+                }
+            ],
+        }
+    )
+
+
+def test_bind_tools_sends_openai_tools_only() -> None:
+    server = Server(weather_call_reply())
+    msg = make_llm(server).bind_tools([get_weather]).invoke("Weather in Paris?")
+    assert msg.tool_calls[0]["args"] == {"city": "Paris"}
+    body = server.bodies[0]
+    assert body["tools"] == [WEATHER_TOOL]
+    assert "tool_choice" not in body
+    assert "parallel_tool_calls" not in body
+
+
+@pytest.mark.parametrize(
+    ("tool_choice", "sent"),
+    [
+        ("auto", "auto"),
+        ("none", "none"),
+        ("required", "required"),
+        ("any", "required"),
+        (True, "required"),
+        ("get_weather", "required"),  # the server can't force one tool
+        ({"type": "function", "function": {"name": "get_time"}}, "required"),
+    ],
+)
+def test_tool_choice_is_sent_as_a_server_string(tool_choice: Any, sent: str) -> None:
+    server = Server(weather_call_reply())
+    llm = make_llm(server).bind_tools([get_weather, get_time], tool_choice=tool_choice)
+    llm.invoke("Weather in Paris?")
+    assert server.bodies[0]["tool_choice"] == sent
+    assert server.bodies[0]["tools"][0] == WEATHER_TOOL  # all tools are still sent
+    assert len(server.bodies[0]["tools"]) == 2
+
+
+@pytest.mark.parametrize("tool_choice", [None, False])
+def test_no_tool_choice_is_left_out(tool_choice: Any) -> None:
+    server = Server(weather_call_reply())
+    make_llm(server).bind_tools([get_weather], tool_choice=tool_choice).invoke("x")
+    assert "tool_choice" not in server.bodies[0]
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [
+        "get_time",  # not bound
+        {"type": "function", "function": {"name": "get_time"}},
+        {"type": "function"},
+        "always",
+    ],
+)
+def test_invalid_tool_choice(tool_choice: Any) -> None:
+    with pytest.raises(ValueError, match="tool_choice must be"):
+        make_llm(Server()).bind_tools([get_weather], tool_choice=tool_choice)
+
+
+def test_strict_parallel_tool_calls_and_kwargs_are_sent() -> None:
+    server = Server(weather_call_reply())
+    llm = make_llm(server).bind_tools(
+        [get_weather], strict=True, parallel_tool_calls=False, temperature=0
+    )
+    llm.invoke("x")
+    body = server.bodies[0]
+    assert body["tools"][0]["function"]["strict"] is True
+    assert body["parallel_tool_calls"] is False
+    assert body["temperature"] == 0
+
+
+def test_agent_loop_sends_the_tool_call_and_result_back() -> None:
+    final = content_reply("It's 18C and sunny in Paris.")
+    server = Server(weather_call_reply("call_7"), final)
+    llm = make_llm(server).bind_tools([get_weather])
+    messages: list[BaseMessage] = [HumanMessage("Weather in Paris?")]
+    while True:
+        ai = llm.invoke(messages)
+        messages.append(ai)
+        if not ai.tool_calls:
+            break
+        messages.extend(get_weather.invoke(call) for call in ai.tool_calls)
+
+    assert messages[-1].content == "It's 18C and sunny in Paris."
+    assert len(server.requests) == 2
+    assert server.bodies[1]["messages"] == [
+        {"role": "user", "content": "Weather in Paris?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "id": "call_7",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": '{"city": "Paris"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": "get_weather",
+            "tool_call_id": "call_7",
+            "content": "18C and sunny in Paris",
+        },
+    ]
+    assert server.bodies[1]["tools"] == [WEATHER_TOOL]
