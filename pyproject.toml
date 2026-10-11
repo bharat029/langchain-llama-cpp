@@ -1,0 +1,76 @@
+[project]
+name = "langchain-llama-cpp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Bharathan Mudaliar", email = "vbharathan.2013@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.27,<1",
+    "langchain-core>=1.0,<2",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "langchain-tests>=1.1.9",
+    "pyright>=1.1.414",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.17.0",
+]
+
+# Ruff: LangChain partner-package style (langchain-deepseek, langchain-ollama).
+[tool.ruff.format]
+docstring-code-format = true
+docstring-code-line-length = 100
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "CPY001",  # No copyright header in every file
+    "COM812",  # Conflicts with the formatter
+    "ISC001",  # Conflicts with the formatter
+    "ANN401",  # Any is sometimes the honest type (**kwargs passed through)
+    "TC002",   # Moving imports under TYPE_CHECKING breaks pydantic field types
+    "TC003",
+    "RUF012",  # Mutable class defaults: false positives on pydantic models
+    "PLR0913", # Too many arguments: chat models have many parameters
+    "FIX002",  # TODOs are allowed
+    "TD002",
+    "TD003",
+]
+unfixable = ["B028"]  # Pick warnings' stacklevel deliberately
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+ignore-var-parameters = true
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.extend-per-file-ignores]
+"tests/**/*.py" = [
+    "D",       # No docstrings needed in tests
+    "INP001",  # tests/ is not a package
+    "S101",    # Tests use assert
+    "PLR2004", # Magic values in comparisons
+    "SLF001",  # Private member access
+    "ARG001",  # Unused fixture arguments
+    "PT011",   # Broad pytest.raises
+]
+"notebooks/**" = ["T201", "D", "INP001", "ANN"]
+
+# Pyright is the engine inside Pylance, so VS Code and `uv run pyright` agree.
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.10"
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "standard"
+strict = ["src"]
