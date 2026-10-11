@@ -28,8 +28,11 @@ A LangChain chat model (`ChatLlama`) for llama.cpp's `llama-server`, used direct
   - Not enforced: `number` bounds, `multipleOf`.
   - With thinking on, the reasoning comes first and the grammar applies only to `content`.
 - **Response:** `message.reasoning_content` (separate from `content`) and `tool_calls[].function.arguments` (a JSON string).
-  - `usage`: `prompt_tokens`, `completion_tokens`, `prompt_tokens_details.cached_tokens`.
-  - `timings`: `cache_n`, `prompt_n`, `prompt_ms`, `predicted_n`, `predicted_ms`, ...
+  - `usage`: `prompt_tokens`, `completion_tokens`, `total_tokens`, `prompt_tokens_details.cached_tokens`.
+    - Probed 2026-10-11 on gemma with thinking on: there is **no `completion_tokens_details`**. Reasoning tokens are included in `completion_tokens` (212 for a 1-token answer) but not reported separately.
+    - `cached_tokens` is part of `prompt_tokens`: a repeat of a 32-token prompt gave `cached_tokens: 27`, `cache_n: 27`, `prompt_n: 5`.
+  - `timings`: `cache_n`, `prompt_n`, `prompt_ms`, `prompt_per_token_ms`, `prompt_per_second`, `predicted_n`, `predicted_ms`, `predicted_per_token_ms`, `predicted_per_second`.
+  - `model` is the file llama-swap loaded (e.g. `google/gemma-4-26B-A4B-it-qat-q4_0-gguf:Q4_0`), not the alias requested (`gemma`). `system_fingerprint` is the build (`b11429-d81235049`). `id` is `chatcmpl-...`.
 - **Streaming:** SSE `data: {...}` and a final `data: [DONE]`.
   - Each `delta` carries `content`, `reasoning_content` or `tool_calls` fragments (`index`; the id and name come first, the arguments in pieces).
   - With `stream_options.include_usage`, a final chunk with `choices: []` carries `usage` and `timings`.
@@ -40,6 +43,11 @@ A LangChain chat model (`ChatLlama`) for llama.cpp's `llama-server`, used direct
 - **Native endpoints:** `/props` (`default_generation_settings.n_ctx`, defaults, `chat_template`, `chat_template_caps`), `/apply-template` (`{messages, tools?, chat_template_kwargs?}` → `{prompt}`), `/tokenize`. Through llama-swap, these load the model.
 - **Thinking switches** (`chat_template_kwargs`) differ per model family: gemma/qwen `enable_thinking: bool`; gpt-oss `reasoning_effort: low|medium|high` (it always reasons). Thinking tokens count towards `max_tokens`.
 - **Chat templates** ignore `name` on system/user/assistant messages.
+- **Reasoning in history** (probed 2026-10-11 with `/apply-template`): llama-server passes an assistant message's `reasoning_content` to the template, and the template decides what to render.
+  - Every model keeps the reasoning of the current tool-call turn: gemma `<|channel>thought`, qwen `<think>`, gpt-oss `<|channel|>analysis`.
+  - gemma and gpt-oss drop reasoning from earlier turns.
+  - qwen keeps earlier turns by default (`chat_template_caps.supports_preserve_reasoning: true`); `chat_template_kwargs: {"preserve_thinking": false}` drops them.
+  - **Decision (M1-c):** always send `reasoning_content` when an `AIMessage` has it, converting v1 reasoning blocks back. Never strip it on our side. This is what ChatOllama does (sent back as `thinking`); ChatOpenAI, ChatDeepSeek and ChatGroq drop it.
 
 ## langchain-core facts the code depends on (1.6.9)
 - **Abstract methods:** `_generate(messages, stop, run_manager, **kwargs) -> ChatResult` and the `_llm_type` property. Optional: `_stream`, `_agenerate`, `_astream`, `bind_tools`, `with_structured_output`, `_identifying_params`, `_get_ls_params`.
