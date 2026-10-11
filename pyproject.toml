@@ -41,6 +41,7 @@ ignore = [
     "TC003",
     "RUF012",  # Mutable class defaults: false positives on pydantic models
     "PLR0913", # Too many arguments: chat models have many parameters
+    "PERF203", # try/except in a loop: rarely useful (as langchain-ollama)
     "FIX002",  # TODOs are allowed
     "TD002",
     "TD003",
