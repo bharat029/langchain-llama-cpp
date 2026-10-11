@@ -8,7 +8,12 @@ A LangChain chat model (`ChatLlama`) for llama.cpp's `llama-server`, used direct
 - **Name:** distribution `langchain-llama-cpp`, import `langchain_llama_cpp`, class `ChatLlama`.
 - **Servers (v0): llama-swap only.** `model` picks the entry; native endpoints live at `/upstream/<model>/...`. No `server` field and no detection.
   - Later: bare llama-server and auto-detection, maybe via llama-server's own router mode replacing llama-swap. The plan then: a lazy `GET /running` probe on the first call, cached, with no network at construction, matching ChatOpenAI, ChatOllama and ChatDeepSeek; optionally an opt-in eager check like ChatOllama's `validate_model_on_init`.
-- **Parameters:** typed fields for every llama.cpp option we support. A field left at `None` is left out of the request.
+- **Parameters:** a typed field for **every** request field `/v1/chat/completions` accepts. The list comes from the llama.cpp source for the server's build (b11429: `tools/server/server-common.cpp` `oaicompat_chat_params_parse`, `server-schema.cpp` `make_llama_cmpl_schema`, `server-context.cpp` `id_slot`). Each field is sent under its own name; `None` (the default) is left out, so the server's per-model defaults apply. `test_request_fields_match_llama_server` pins the list (60 fields); update it when the server build changes.
+  - Not typed, because another API owns them: `messages`; `tools`, `tool_choice`, `parallel_tool_calls` (milestone 4, `bind_tools`); `response_format` (milestone 3, `with_structured_output`); `stream`, `stream_options` (milestone 2).
+  - Not typed, because the chat layer overwrites them (template plumbing): `prompt`, `chat_format`, `generation_prompt`, `chat_parser`, `grammar_lazy`, `grammar_triggers`, `preserved_tokens`, `parse_tool_calls`, `message_delimiters`, `reasoning_budget_start_tag`, `reasoning_budget_end_tags`.
+  - Aliases, not separate fields: `n_predict`/`max_completion_tokens` → `max_tokens`, `n_cmpl` → `n`, `thinking_budget_tokens` → `reasoning_budget_tokens`.
+  - `verbose` clashes with core's own `verbose` field (callback verbosity), so it isn't typed; pass it per call with `invoke(..., verbose=True)` if you need it.
+  - Speculative-decoding fields are compiled out (`#if 0`) in b11429.
 - **Python** 3.10+. Dependencies: `langchain-core>=1.0,<2`, `httpx>=0.27,<1`.
 - **Milestones**, each ending with passing tests and a review:
   1. `invoke`: message conversion, reasoning, usage, `response_metadata`, clear errors for 400 overflow and 404.

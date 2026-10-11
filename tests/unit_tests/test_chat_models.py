@@ -25,6 +25,7 @@ from langchain_llama_cpp import (
     LlamaModelNotFoundError,
 )
 from langchain_llama_cpp import chat_models as chat_models_module
+from langchain_llama_cpp.chat_models import request_field_names
 
 BASE_URL = "http://llama.test:8080"
 
@@ -447,3 +448,88 @@ def test_per_call_model_is_sent() -> None:
     server = Server(ok())
     make_llm(server).invoke("hi", model="qwen")
     assert server.bodies[0]["model"] == "qwen"
+
+
+# --- request field coverage ------------------------------------------------
+
+# One value per request field, keyed by wire name (llama.cpp b11429).
+ALL_FIELDS: dict[str, Any] = {
+    "max_tokens": 300,
+    "stop": ["\n\n"],
+    "ignore_eos": False,
+    "t_max_predict_ms": 5000,
+    "n_indent": 4,
+    "n": 1,
+    "temperature": 0.7,
+    "dynatemp_range": 0.1,
+    "dynatemp_exponent": 1.0,
+    "top_k": 40,
+    "top_p": 0.9,
+    "min_p": 0.05,
+    "typical_p": 1.0,
+    "top_n_sigma": -1.0,
+    "xtc_probability": 0.0,
+    "xtc_threshold": 0.1,
+    "mirostat": 0,
+    "mirostat_tau": 5.0,
+    "mirostat_eta": 0.1,
+    "adaptive_target": -1.0,
+    "adaptive_decay": 0.9,
+    "min_keep": 1,
+    "samplers": ["top_k", "min_p", "temperature"],
+    "seed": 42,
+    "backend_sampling": False,
+    "repeat_penalty": 1.1,
+    "repeat_last_n": 64,
+    "frequency_penalty": 0.1,
+    "presence_penalty": 0.1,
+    "dry_multiplier": 0.8,
+    "dry_base": 1.75,
+    "dry_allowed_length": 2,
+    "dry_penalty_last_n": 64,
+    "dry_sequence_breakers": ["\n"],
+    "logit_bias": {"15043": -1.0},
+    "grammar": 'root ::= "yes" | "no"',
+    "json_schema": {"type": "object"},
+    "chat_template_kwargs": {"enable_thinking": False},
+    "reasoning_format": "deepseek",
+    "reasoning_effort": "low",
+    "reasoning_budget_tokens": 200,
+    "reasoning_budget_message": "Time to answer.",
+    "reasoning_control": True,
+    "add_generation_prompt": True,
+    "continue_final_message": False,
+    "echo": False,
+    "logprobs": True,
+    "top_logprobs": 5,
+    "n_probs": 5,
+    "post_sampling_probs": True,
+    "return_tokens": True,
+    "timings_per_token": True,
+    "response_fields": ["choices", "usage"],
+    "cache_prompt": True,
+    "n_cache_reuse": 256,
+    "n_keep": -1,
+    "n_discard": 0,
+    "id_slot": 0,
+    "lora": [{"id": 0, "scale": 1.0}],
+    "return_progress": False,
+    "sse_ping_interval": 10,
+}
+
+
+def test_request_fields_match_llama_server() -> None:
+    assert request_field_names() == list(ALL_FIELDS)
+
+
+def test_every_request_field_is_sent_under_its_own_name() -> None:
+    server = Server(ok())
+    make_llm(server, **ALL_FIELDS).invoke("hi")
+    body = server.bodies[0]
+    assert {key: body[key] for key in ALL_FIELDS} == ALL_FIELDS
+
+
+def test_core_verbose_is_not_a_request_field() -> None:
+    server = Server(ok())
+    make_llm(server, verbose=True).invoke("hi")
+    assert "verbose" not in server.bodies[0]

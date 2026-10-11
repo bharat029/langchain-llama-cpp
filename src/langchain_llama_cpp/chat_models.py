@@ -3,7 +3,7 @@
 import random
 import time
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from langchain_core.callbacks import CallbackManagerForLLMRun
@@ -66,29 +66,214 @@ class ChatLlama(BaseChatModel):
     )
     """Server root, e.g. `http://localhost:8080`. Defaults to `LLAMA_BASE_URL`."""
 
-    temperature: float | None = None
-    """Sampling temperature."""
+    # --- Request fields -----------------------------------------------------
+    # Every field accepted by /v1/chat/completions in llama.cpp b11429
+    # (tools/server/server-common.cpp oaicompat_chat_params_parse,
+    # server-schema.cpp make_llama_cmpl_schema, server-context.cpp id_slot).
+    # Each is sent under its own name; None (the default) leaves it out, so the
+    # server's per-model default applies (see `get_server_defaults`).
 
+    # Length and stopping
     max_tokens: int | None = None
-    """Maximum tokens to generate. Thinking tokens count towards it."""
-
-    top_p: float | None = None
-    """Nucleus sampling: keep the smallest set of tokens with this total probability."""
-
-    top_k: int | None = None
-    """Keep only the k most likely tokens (llama.cpp extension)."""
-
-    min_p: float | None = None
-    """Drop tokens below this fraction of the top token's probability (llama.cpp)."""
-
-    seed: int | None = None
-    """Random seed for sampling."""
+    """Maximum tokens to generate (-1 = no limit). Thinking tokens count too."""
 
     stop: list[str] | None = None
-    """Stop sequences."""
+    """Stop strings. Generation ends at the first one, which is not returned."""
 
+    ignore_eos: bool | None = None
+    """Ignore the end-of-sequence token and keep generating."""
+
+    t_max_predict_ms: int | None = None
+    """Stop generating after this many ms from the first token, at a newline."""
+
+    n_indent: int | None = None
+    """Minimum line indentation, in spaces, for generated text (code completion)."""
+
+    n: int | None = None
+    """Number of completions to generate (1 to the server's slot count)."""
+
+    # Sampling
+    temperature: float | None = None
+    """Randomness (0 = greedy)."""
+
+    dynatemp_range: float | None = None
+    """Dynamic temperature: final value in `temperature ± range` (0 = off)."""
+
+    dynatemp_exponent: float | None = None
+    """Dynamic temperature: how entropy maps to temperature."""
+
+    top_k: int | None = None
+    """Keep only the k most likely tokens (0 = off)."""
+
+    top_p: float | None = None
+    """Keep the smallest set of tokens with this total probability (1.0 = off)."""
+
+    min_p: float | None = None
+    """Drop tokens below this fraction of the top token's probability (0 = off)."""
+
+    typical_p: float | None = None
+    """Locally typical sampling (1.0 = off)."""
+
+    top_n_sigma: float | None = None
+    """Keep tokens within n standard deviations of the top logit (< 0 = off)."""
+
+    xtc_probability: float | None = None
+    """Chance that the XTC sampler removes top tokens (0 = off)."""
+
+    xtc_threshold: float | None = None
+    """Minimum probability for XTC removal (> 0.5 turns XTC off)."""
+
+    mirostat: Literal[0, 1, 2] | None = None
+    """Mirostat sampling: 0 = off, 1 = Mirostat, 2 = Mirostat 2.0."""
+
+    mirostat_tau: float | None = None
+    """Mirostat target entropy (tau)."""
+
+    mirostat_eta: float | None = None
+    """Mirostat learning rate (eta)."""
+
+    adaptive_target: float | None = None
+    """Adaptive sampling target entropy, 0.0 to 1.0 (negative = off)."""
+
+    adaptive_decay: float | None = None
+    """Adaptive sampling EMA decay, 0.0 to 0.99."""
+
+    min_keep: int | None = None
+    """Make every sampler keep at least this many tokens."""
+
+    samplers: list[str] | str | None = None
+    """Sampler order: names (`["top_k", "min_p", ...]`) or a string of sampler chars."""
+
+    seed: int | None = None
+    """Random seed (-1 = random)."""
+
+    backend_sampling: bool | None = None
+    """Sample on the backend instead of in llama.cpp's sampler."""
+
+    # Repetition penalties
+    repeat_penalty: float | None = None
+    """Penalty for repeated tokens (1.0 = off)."""
+
+    repeat_last_n: int | None = None
+    """How many recent tokens the repeat penalty looks at (0 = off)."""
+
+    frequency_penalty: float | None = None
+    """Penalty that grows with how often a token appeared (0 = off)."""
+
+    presence_penalty: float | None = None
+    """Penalty for any token that already appeared (0 = off)."""
+
+    dry_multiplier: float | None = None
+    """DRY repetition penalty multiplier (0 = off)."""
+
+    dry_base: float | None = None
+    """DRY penalty base (>= 1.0; smaller values fall back to the server default)."""
+
+    dry_allowed_length: int | None = None
+    """Repeats longer than this get the DRY penalty."""
+
+    dry_penalty_last_n: int | None = None
+    """How many tokens DRY scans for repeats (0 = off)."""
+
+    dry_sequence_breakers: list[str] | None = None
+    """Strings that reset DRY's repeat matching (non-empty list)."""
+
+    logit_bias: dict[str, float | bool] | list[list[Any]] | None = None
+    """Token bias: `{"token_or_id": bias}` or `[[token_or_id, bias], ...]`.
+
+    A bias of `False` bans the token.
+    """
+
+    # Constrained output (with_structured_output builds on these)
+    grammar: str | None = None
+    """A GBNF grammar the output must follow. Can't be combined with tools."""
+
+    json_schema: dict[str, Any] | None = None
+    """A JSON schema the output must follow (llama.cpp's own field)."""
+
+    # Chat template and reasoning
     chat_template_kwargs: dict[str, Any] | None = None
     """Variables for the chat template, e.g. `{"enable_thinking": False}`."""
+
+    reasoning_format: str | None = None
+    """Where thinking goes: `"auto"`/`"deepseek"` → `reasoning_content`.
+
+    `"none"` leaves it in the content text; `"deepseek-legacy"` does both.
+    """
+
+    reasoning_effort: str | None = None
+    """OpenAI-style effort (`"low"`, `"medium"`, `"high"`); `"none"` turns thinking off.
+
+    Passed to the template as `reasoning_effort` (gpt-oss).
+    """
+
+    reasoning_budget_tokens: int | None = None
+    """Cap on thinking tokens (-1 = no cap); then the end-of-thinking tag is forced."""
+
+    reasoning_budget_message: str | None = None
+    """Text inserted before the forced end-of-thinking tag."""
+
+    reasoning_control: bool | None = None
+    """Create the reasoning-budget sampler so thinking can be ended at runtime."""
+
+    add_generation_prompt: bool | None = None
+    """Whether the template appends the assistant turn's opening (default true)."""
+
+    continue_final_message: bool | str | None = None
+    """Continue the last assistant message instead of starting a new turn."""
+
+    echo: bool | None = None
+    """Echo the input tokens in the output."""
+
+    # Probabilities and debugging output
+    logprobs: bool | None = None
+    """Return token probabilities (llama.cpp's format, not exactly OpenAI's)."""
+
+    top_logprobs: int | None = None
+    """How many top tokens to return per position (needs `logprobs`; default 20)."""
+
+    n_probs: int | None = None
+    """llama.cpp's native form of `top_logprobs` (no `logprobs` flag needed)."""
+
+    post_sampling_probs: bool | None = None
+    """Report probabilities after the sampler chain instead of before."""
+
+    return_tokens: bool | None = None
+    """Also return the generated token ids."""
+
+    timings_per_token: bool | None = None
+    """Include timing information in every response chunk."""
+
+    response_fields: list[str] | None = None
+    """Only return these reply fields. Can remove fields ChatLlama reads."""
+
+    # Server resources and caching
+    cache_prompt: bool | None = None
+    """Reuse the KV cache for a shared prompt prefix (server default: on)."""
+
+    n_cache_reuse: int | None = None
+    """Minimum chunk size to reuse from the cache via KV shifting."""
+
+    n_keep: int | None = None
+    """Prompt tokens to keep when the context is shifted (-1 = all)."""
+
+    n_discard: int | None = None
+    """Tokens after `n_keep` that a context shift may drop (0 = half)."""
+
+    id_slot: int | None = None
+    """Run on this server slot (-1 = any free slot)."""
+
+    lora: list[dict[str, Any]] | None = None
+    """LoRA adapters for this request: `[{"id": 0, "scale": 1.0}, ...]`."""
+
+    # Streaming only (used from milestone 2)
+    return_progress: bool | None = None
+    """Send prompt-processing progress events while streaming."""
+
+    sse_ping_interval: int | None = None
+    """Seconds between keep-alive pings on a silent stream (-1 = off)."""
+
+    # --- Client settings (not sent) ----------------------------------------
 
     timeout: float | httpx.Timeout | None = None
     """Request timeout in seconds. `None` (the default) means no timeout."""
@@ -108,16 +293,7 @@ class ChatLlama(BaseChatModel):
     @property
     def _params(self) -> dict[str, Any]:
         """Request fields set on the model; fields left at `None` are left out."""
-        params = {
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "top_p": self.top_p,
-            "top_k": self.top_k,
-            "min_p": self.min_p,
-            "seed": self.seed,
-            "stop": self.stop,
-            "chat_template_kwargs": self.chat_template_kwargs,
-        }
+        params = {name: getattr(self, name) for name in request_field_names()}
         return {key: value for key, value in params.items() if value is not None}
 
     @property
@@ -240,6 +416,26 @@ class ChatLlama(BaseChatModel):
             time.sleep(_retry_delay(attempt, retry_after))
         msg = "unreachable"  # the loop always returns or raises
         raise AssertionError(msg)
+
+
+# ChatLlama fields that configure the client rather than the request.
+_CLIENT_FIELDS = frozenset(
+    {"model", "base_url", "timeout", "max_retries", "http_client"}
+)
+
+
+def request_field_names() -> list[str]:
+    """Names of ChatLlama's request fields, in declaration order.
+
+    Everything ChatLlama declares itself, minus the client settings. `model` is
+    sent too, but always (it's required), so it isn't listed here.
+    """
+    inherited = BaseChatModel.model_fields
+    return [
+        name
+        for name in ChatLlama.model_fields
+        if name not in inherited and name not in _CLIENT_FIELDS
+    ]
 
 
 def _convert_message(message: BaseMessage) -> dict[str, Any]:
