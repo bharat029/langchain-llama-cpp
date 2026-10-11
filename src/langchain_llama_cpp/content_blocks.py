@@ -20,7 +20,7 @@ For streamed chunks the translator returns core's blocks with two changes:
 The blocks are copies: reading `content_blocks` never changes the message.
 """
 
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any
 
 from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.messages.block_translators import register_translator
@@ -30,13 +30,15 @@ if TYPE_CHECKING:
 
 MODEL_PROVIDER = "llama-cpp"
 
-_M = TypeVar("_M", AIMessage, AIMessageChunk)
-
 _TOOL_CALL_TYPES = {"tool_call", "invalid_tool_call", "tool_call_chunk"}
 
 
-def _default_blocks(message: _M) -> list["types.ContentBlock"]:
-    """Core's best-effort blocks: a copy without our provider skips the registry."""
+def translate_content(message: AIMessage) -> list["types.ContentBlock"]:
+    """Core's best-effort blocks, unchanged (a whole message isn't merged).
+
+    A copy of the message without our `model_provider` skips the registry, so
+    core falls back to its own parsing instead of calling us again.
+    """
     metadata = {
         key: value
         for key, value in message.response_metadata.items()
@@ -45,14 +47,9 @@ def _default_blocks(message: _M) -> list["types.ContentBlock"]:
     return message.model_copy(update={"response_metadata": metadata}).content_blocks
 
 
-def translate_content(message: AIMessage) -> list["types.ContentBlock"]:
-    """Blocks for a whole message: core's, unchanged (nothing is merged)."""
-    return _default_blocks(message)
-
-
 def translate_content_chunk(message: AIMessageChunk) -> list["types.ContentBlock"]:
     """Blocks for a streamed chunk: core's, with tool-call chunks re-indexed."""
-    blocks: list[dict[str, Any]] = [dict(block) for block in _default_blocks(message)]
+    blocks: list[dict[str, Any]] = [dict(block) for block in translate_content(message)]
     if message.tool_call_chunks and message.chunk_position != "last":
         blocks = [block for block in blocks if block["type"] not in _TOOL_CALL_TYPES]
         for chunk in message.tool_call_chunks:

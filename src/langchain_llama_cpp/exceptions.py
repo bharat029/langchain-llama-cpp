@@ -95,23 +95,13 @@ def error_from_response(response: httpx.Response) -> httpx.HTTPStatusError:
     detail = _json_object(raw_detail)
     reason = detail.get("message") or raw_detail or response.text
     message = f"HTTP {response.status_code} from {response.request.url}: {reason}"
-    request, status = response.request, response.status_code
-
-    if detail.get("type") == "exceed_context_size_error":
-        return LlamaContextOverflowError(
-            message,
-            request=request,
-            response=response,
-            n_prompt_tokens=detail.get("n_prompt_tokens"),
-            n_ctx=detail.get("n_ctx"),
-        )
-    if status in _STATUS_ERRORS:
-        cls = _STATUS_ERRORS[status]
-    elif status >= 500:  # noqa: PLR2004
-        cls = LlamaAPIError
-    else:
-        cls = LlamaInvalidRequestError
-    return cls(message, request=request, response=response)
+    return _build_error(
+        message,
+        detail,
+        response.status_code,
+        response,
+        fallback=LlamaInvalidRequestError,  # e.g. a 3xx that wasn't followed
+    )
 
 
 def error_from_stream_event(
@@ -125,21 +115,39 @@ def error_from_stream_event(
     fields = _json_object(detail)
     reason = fields.get("message") or detail or "error during streaming"
     message = f"Error during streaming from {response.request.url}: {reason}"
-    request = response.request
     code = fields.get("code")
-    if fields.get("type") == "exceed_context_size_error":
+    status = code if isinstance(code, int) else None
+    return _build_error(message, fields, status, response, fallback=LlamaAPIError)
+
+
+def _build_error(
+    message: str,
+    detail: dict[str, Any],
+    status: int | None,
+    response: httpx.Response,
+    *,
+    fallback: type[httpx.HTTPStatusError],
+) -> httpx.HTTPStatusError:
+    """Pick the error class from llama-server's error `type` and the status.
+
+    Overflow is recognised by `type`, then the status decides: a mapped code,
+    any other 4xx (invalid request), 5xx (API error), else `fallback`.
+    """
+    request = response.request
+    if detail.get("type") == "exceed_context_size_error":
         return LlamaContextOverflowError(
             message,
             request=request,
             response=response,
-            n_prompt_tokens=fields.get("n_prompt_tokens"),
-            n_ctx=fields.get("n_ctx"),
+            n_prompt_tokens=detail.get("n_prompt_tokens"),
+            n_ctx=detail.get("n_ctx"),
         )
-    if isinstance(code, int) and code in _STATUS_ERRORS:
-        cls = _STATUS_ERRORS[code]
-    elif isinstance(code, int) and 400 <= code < 500:  # noqa: PLR2004
+    cls = fallback
+    if status in _STATUS_ERRORS:
+        cls = _STATUS_ERRORS[status]
+    elif status is not None and 400 <= status < 500:  # noqa: PLR2004
         cls = LlamaInvalidRequestError
-    else:
+    elif status is not None and status >= 500:  # noqa: PLR2004
         cls = LlamaAPIError
     return cls(message, request=request, response=response)
 

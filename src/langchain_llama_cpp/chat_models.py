@@ -351,7 +351,7 @@ class ChatLlama(BaseChatModel):
     @property
     def _params(self) -> dict[str, Any]:
         """Request fields set on the model; fields left at `None` are left out."""
-        params = {name: getattr(self, name) for name in request_field_names()}
+        params = {name: getattr(self, name) for name in _REQUEST_FIELDS}
         return {key: value for key, value in params.items() if value is not None}
 
     @property
@@ -745,7 +745,8 @@ class ChatLlama(BaseChatModel):
         With `stream=True` this returns once the headers arrive, so retries only
         cover the request itself; a failure mid-stream is raised, not retried.
         """
-        for attempt in range(self.max_retries + 1):
+        attempt = 0
+        while True:
             try:
                 response = client.send(request, stream=stream)
             except httpx.TransportError as exc:
@@ -757,17 +758,17 @@ class ChatLlama(BaseChatModel):
                 response.close()
                 error, cause = error_from_response(response), None
                 retry_after = _retry_after(response)
-            if not _is_retryable(error) or attempt == self.max_retries:
+            if not _is_retryable(error) or attempt >= self.max_retries:
                 raise error from cause
             time.sleep(_retry_delay(attempt, retry_after))
-        msg = "unreachable"  # the loop always returns or raises
-        raise AssertionError(msg)
+            attempt += 1
 
     async def _asend(
         self, client: httpx.AsyncClient, request: httpx.Request, *, stream: bool
     ) -> httpx.Response:
         """Async twin of `_send`."""
-        for attempt in range(self.max_retries + 1):
+        attempt = 0
+        while True:
             try:
                 response = await client.send(request, stream=stream)
             except httpx.TransportError as exc:
@@ -779,11 +780,10 @@ class ChatLlama(BaseChatModel):
                 await response.aclose()
                 error, cause = error_from_response(response), None
                 retry_after = _retry_after(response)
-            if not _is_retryable(error) or attempt == self.max_retries:
+            if not _is_retryable(error) or attempt >= self.max_retries:
                 raise error from cause
             await asyncio.sleep(_retry_delay(attempt, retry_after))
-        msg = "unreachable"
-        raise AssertionError(msg)
+            attempt += 1
 
 
 # ChatLlama fields that configure the client rather than the request.
@@ -835,6 +835,9 @@ def request_field_names() -> list[str]:
         for name in ChatLlama.model_fields
         if name not in inherited and name not in _CLIENT_FIELDS
     ]
+
+
+_REQUEST_FIELDS = tuple(request_field_names())  # fixed once the class exists
 
 
 def _tool_choice(
@@ -1033,15 +1036,8 @@ def _convert_response_message(message: Mapping[str, Any]) -> AIMessage:
         except OutputParserException as exc:  # arguments aren't valid JSON
             invalid_tool_calls.append(make_invalid_tool_call(raw, str(exc)))
             continue
-        if parsed is not None:
-            tool_calls.append(
-                ToolCall(
-                    name=parsed["name"],
-                    args=parsed["args"],
-                    id=parsed.get("id"),
-                    type="tool_call",
-                )
-            )
+        if parsed is not None:  # with return_id, already a complete ToolCall
+            tool_calls.append(cast("ToolCall", parsed))
     return AIMessage(
         content=message.get("content") or "",
         additional_kwargs=additional_kwargs,
