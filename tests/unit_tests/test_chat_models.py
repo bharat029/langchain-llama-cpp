@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections.abc import Callable
 from typing import Any
@@ -11,6 +12,7 @@ from langchain_core.exceptions import (
 )
 from langchain_core.messages import (
     AIMessage,
+    AIMessageChunk,
     HumanMessage,
     SystemMessage,
     ToolMessage,
@@ -89,8 +91,14 @@ class Server:
 
 
 def make_llm(server: Server, **kwargs: Any) -> ChatLlama:
-    client = httpx.Client(transport=httpx.MockTransport(server))
-    return ChatLlama(model="gemma", base_url=BASE_URL, http_client=client, **kwargs)
+    transport = httpx.MockTransport(server)
+    return ChatLlama(
+        model="gemma",
+        base_url=BASE_URL,
+        http_client=httpx.Client(transport=transport),
+        http_async_client=httpx.AsyncClient(transport=transport),
+        **kwargs,
+    )
 
 
 def ok(body: dict[str, Any] | None = None) -> httpx.Response:
@@ -99,9 +107,14 @@ def ok(body: dict[str, Any] | None = None) -> httpx.Response:
 
 @pytest.fixture(autouse=True)
 def no_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    """Record retry delays instead of sleeping."""
+    """Record retry delays instead of sleeping (sync and async)."""
     delays: list[float] = []
+
+    async def fake_async_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
     monkeypatch.setattr(chat_models_module.time, "sleep", delays.append)
+    monkeypatch.setattr(chat_models_module.asyncio, "sleep", fake_async_sleep)
     return delays
 
 
@@ -533,3 +546,187 @@ def test_core_verbose_is_not_a_request_field() -> None:
     server = Server(ok())
     make_llm(server, verbose=True).invoke("hi")
     assert "verbose" not in server.bodies[0]
+
+
+# --- streaming -------------------------------------------------------------
+
+CHUNK_BASE = {
+    "created": 1791710126,
+    "id": "chatcmpl-pmligs5DcXIiejxeskv7YlviseIhyB8W",
+    "model": "google/gemma-4-26B-A4B-it-qat-q4_0-gguf:Q4_0",
+    "system_fingerprint": "b11429-d81235049",
+    "object": "chat.completion.chunk",
+}
+STREAM_USAGE = {
+    "completion_tokens": 5,
+    "prompt_tokens": 32,
+    "total_tokens": 37,
+    "prompt_tokens_details": {"cached_tokens": 27},
+}
+STREAM_TIMINGS = {"cache_n": 27, "prompt_n": 5, "predicted_n": 5}
+
+
+def delta(finish_reason: str | None = None, **fields: Any) -> dict[str, Any]:
+    choice = {"finish_reason": finish_reason, "index": 0, "delta": fields}
+    return {"choices": [choice], **CHUNK_BASE}
+
+
+# Shaped like llama-server b11429's stream (probe of 2026-10-11).
+EVENTS = [
+    delta(role="assistant", content=None),
+    delta(reasoning_content="17 x 23"),
+    delta(reasoning_content=" = 391."),
+    delta(content="39"),
+    delta(content="1"),
+    delta(finish_reason="stop"),
+    {"choices": [], **CHUNK_BASE, "usage": STREAM_USAGE, "timings": STREAM_TIMINGS},
+]
+
+
+def sse(*events: dict[str, Any], tail: str = "data: [DONE]\n\n") -> httpx.Response:
+    body = "".join(f"data: {json.dumps(event)}\n\n" for event in events) + tail
+    headers = {"content-type": "text/event-stream"}
+    return httpx.Response(200, content=body.encode(), headers=headers)
+
+
+def merge(chunks: list[AIMessageChunk]) -> AIMessageChunk:
+    merged = chunks[0]
+    for chunk in chunks[1:]:
+        merged += chunk
+    return merged
+
+
+def test_stream_request_body() -> None:
+    server = Server(sse(*EVENTS))
+    list(make_llm(server, max_tokens=300).stream("hi"))
+    body = server.bodies[0]
+    assert body["stream"] is True
+    assert body["stream_options"] == {"include_usage": True}
+    assert body["max_tokens"] == 300
+
+
+def test_stream_chunks_and_merged_message() -> None:
+    chunks = list(make_llm(Server(sse(*EVENTS))).stream("hi"))
+    assert [c.content for c in chunks if c.content] == ["39", "1"]
+    msg = merge(chunks)
+    assert msg.content == "391"
+    assert msg.additional_kwargs == {"reasoning_content": "17 x 23 = 391."}
+    assert msg.usage_metadata == {
+        "input_tokens": 32,
+        "output_tokens": 5,
+        "total_tokens": 37,
+        "input_token_details": {"cache_read": 27},
+        "output_token_details": {},
+    }
+    meta = msg.response_metadata
+    # Each string appears once, so none is concatenated across chunks.
+    assert meta["finish_reason"] == "stop"
+    assert meta["model_name"] == CHUNK_BASE["model"]
+    assert meta["system_fingerprint"] == CHUNK_BASE["system_fingerprint"]
+    assert meta["model_provider"] == "llama-cpp"
+    assert meta["timings"] == STREAM_TIMINGS
+
+
+def test_stream_usage_can_be_turned_off() -> None:
+    server = Server(sse(*EVENTS[:-1]), sse(*EVENTS[:-1]))
+    list(make_llm(server, stream_usage=False).stream("hi"))
+    list(make_llm(server).stream("hi", stream_usage=False))
+    assert all("stream_options" not in body for body in server.bodies)
+    assert all("stream_usage" not in body for body in server.bodies)
+
+
+def test_pings_and_blank_lines_are_skipped() -> None:
+    events = "".join(f"data: {json.dumps(event)}\n\n" for event in EVENTS)
+    body = ": ping\n\n:\n\n" + events + "data: [DONE]\n\n"
+    response = httpx.Response(200, content=body.encode())
+    assert merge(list(make_llm(Server(response)).stream("hi"))).content == "391"
+
+
+def test_streamed_tool_call_fragments_merge() -> None:
+    def tool(**fields: Any) -> dict[str, Any]:
+        return delta(tool_calls=[{"index": 0, **fields}])
+
+    events = [
+        delta(role="assistant", content=None),
+        tool(id="call_1", type="function", function={"name": "get_weather"}),
+        tool(function={"arguments": '{"city": '}),
+        tool(function={"arguments": '"Paris"}'}),
+        delta(finish_reason="tool_calls"),
+    ]
+    msg = merge(list(make_llm(Server(sse(*events))).stream("weather?")))
+    assert msg.tool_calls == [
+        {
+            "name": "get_weather",
+            "args": {"city": "Paris"},
+            "id": "call_1",
+            "type": "tool_call",
+        }
+    ]
+    assert msg.response_metadata["finish_reason"] == "tool_calls"
+
+
+def test_error_before_streaming_is_a_normal_http_error() -> None:
+    server = Server(httpx.Response(400, json=OVERFLOW))
+    with pytest.raises(LlamaContextOverflowError) as info:
+        list(make_llm(server).stream("long prompt"))
+    assert (info.value.n_prompt_tokens, info.value.n_ctx) == (5012, 4096)
+    assert len(server.requests) == 1
+
+
+def test_retry_before_streaming_starts(no_sleep: list[float]) -> None:
+    server = Server(httpx.Response(503, text="loading"), sse(*EVENTS))
+    assert merge(list(make_llm(server).stream("hi"))).content == "391"
+    assert len(server.requests) == 2
+    assert len(no_sleep) == 1
+
+
+def test_error_event_mid_stream_is_raised() -> None:
+    error = {"code": 500, "message": "decode failed", "type": "server_error"}
+    # No [DONE] after an error event, as in llama-server.
+    server = Server(sse(*EVENTS[:5], tail=f"data: {json.dumps({'error': error})}\n\n"))
+    received: list[str] = []
+    with pytest.raises(LlamaAPIError, match="decode failed"):
+        received.extend(chunk.text for chunk in make_llm(server).stream("hi"))
+    assert "".join(received) == "391"  # chunks before the error were delivered
+    assert len(server.requests) == 1  # not retried
+
+
+def test_streaming_field_routes_invoke_through_stream() -> None:
+    server = Server(sse(*EVENTS))
+    msg = make_llm(server, streaming=True).invoke("hi")
+    assert server.bodies[0]["stream"] is True
+    assert msg.content == "391"
+    assert msg.additional_kwargs == {"reasoning_content": "17 x 23 = 391."}
+
+
+# --- async -----------------------------------------------------------------
+
+
+def test_ainvoke() -> None:
+    server = Server(ok())
+    msg = asyncio.run(make_llm(server).ainvoke("hi"))
+    assert msg.content == "391"
+    assert "stream" not in server.bodies[0]
+
+
+def test_astream() -> None:
+    async def collect(llm: ChatLlama) -> list[AIMessageChunk]:
+        return [chunk async for chunk in llm.astream("hi")]
+
+    msg = merge(asyncio.run(collect(make_llm(Server(sse(*EVENTS))))))
+    assert msg.content == "391"
+    assert msg.additional_kwargs == {"reasoning_content": "17 x 23 = 391."}
+    assert msg.usage_metadata is not None
+    assert msg.response_metadata["timings"] == STREAM_TIMINGS
+
+
+def test_async_retry_uses_async_sleep(no_sleep: list[float]) -> None:
+    server = Server(httpx.Response(500, text="boom"), ok())
+    assert asyncio.run(make_llm(server).ainvoke("hi")).content == "391"
+    assert len(no_sleep) == 1
+
+
+def test_async_errors_are_mapped() -> None:
+    server = Server(httpx.Response(400, json=OVERFLOW))
+    with pytest.raises(LlamaContextOverflowError):
+        asyncio.run(make_llm(server).ainvoke("long prompt"))

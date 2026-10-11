@@ -1,16 +1,22 @@
 """ChatLlama: a LangChain chat model for llama.cpp's llama-server behind llama-swap."""
 
+import asyncio
+import json
 import random
 import time
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
 from typing import Any, Literal
 
 import httpx
-from langchain_core.callbacks import CallbackManagerForLLMRun
+from langchain_core.callbacks import (
+    AsyncCallbackManagerForLLMRun,
+    CallbackManagerForLLMRun,
+)
 from langchain_core.exceptions import ModelError, OutputParserException
 from langchain_core.language_models import BaseChatModel, LangSmithParams
 from langchain_core.messages import (
     AIMessage,
+    AIMessageChunk,
     BaseMessage,
     InvalidToolCall,
     ToolCall,
@@ -21,15 +27,21 @@ from langchain_core.messages.ai import (
     OutputTokenDetails,
     UsageMetadata,
 )
+from langchain_core.messages.tool import ToolCallChunk
+from langchain_core.messages.tool import tool_call_chunk as create_tool_call_chunk
 from langchain_core.output_parsers.openai_tools import (
     make_invalid_tool_call,
     parse_tool_call,
 )
-from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.utils import from_env
 from pydantic import Field, PrivateAttr
 
-from langchain_llama_cpp.exceptions import error_from_response, error_from_transport
+from langchain_llama_cpp.exceptions import (
+    error_from_response,
+    error_from_stream_event,
+    error_from_transport,
+)
 
 CHAT_COMPLETIONS = "/v1/chat/completions"
 MODEL_PROVIDER = "llama-cpp"
@@ -281,10 +293,24 @@ class ChatLlama(BaseChatModel):
     max_retries: int = 2
     """Retries for connection errors, timeouts, 429 and 5xx. 0 turns them off."""
 
+    streaming: bool = False
+    """Route `invoke` through streaming (core reads this field, as for ChatOpenAI)."""
+
+    stream_usage: bool = True
+    """Ask for the final usage chunk (`stream_options.include_usage`) when streaming.
+
+    llama-server supports it, so it's on by default; the chunk also carries
+    `timings`. Can be overridden per call with `stream_usage=`.
+    """
+
     http_client: httpx.Client | None = Field(default=None, exclude=True)
     """Your own `httpx.Client`. If given, `timeout` is not applied to it."""
 
+    http_async_client: httpx.AsyncClient | None = Field(default=None, exclude=True)
+    """Your own `httpx.AsyncClient` for async calls. `timeout` isn't applied to it."""
+
     _client: httpx.Client | None = PrivateAttr(default=None)
+    _async_client: httpx.AsyncClient | None = PrivateAttr(default=None)
 
     @property
     def _llm_type(self) -> str:
@@ -344,6 +370,63 @@ class ChatLlama(BaseChatModel):
         response = self._request("POST", CHAT_COMPLETIONS, payload)
         return _create_chat_result(response.json())
 
+    async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,  # noqa: ARG002
+        **kwargs: Any,
+    ) -> ChatResult:
+        payload = self._build_payload(messages, stop, **kwargs)
+        response = await self._arequest("POST", CHAT_COMPLETIONS, payload)
+        return _create_chat_result(response.json())
+
+    def _stream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,  # noqa: ARG002
+        **kwargs: Any,
+    ) -> Iterator[ChatGenerationChunk]:
+        # Core calls run_manager.on_llm_new_token for each chunk itself.
+        payload = self._build_payload(messages, stop, stream=True, **kwargs)
+        request = self._build_request("POST", CHAT_COMPLETIONS, payload)
+        response = self._send(self._get_client(), request, stream=True)
+        try:
+            for line in response.iter_lines():
+                data = _sse_data(line)
+                if data is None:
+                    continue
+                if data == "[DONE]":
+                    break
+                if chunk := _convert_chunk(_sse_event(data, response)):
+                    yield chunk
+        finally:
+            response.close()  # also when the caller stops early
+
+    async def _astream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,  # noqa: ARG002
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        payload = self._build_payload(messages, stop, stream=True, **kwargs)
+        request = self._build_request("POST", CHAT_COMPLETIONS, payload)
+        client = self._get_async_client()
+        response = await self._asend(client, request, stream=True)
+        try:
+            async for line in response.aiter_lines():
+                data = _sse_data(line)
+                if data is None:
+                    continue
+                if data == "[DONE]":
+                    break
+                if chunk := _convert_chunk(_sse_event(data, response)):
+                    yield chunk
+        finally:
+            await response.aclose()
+
     def get_server_defaults(self) -> dict[str, Any]:
         """Fetch the sampling defaults the server uses for this model.
 
@@ -372,8 +455,14 @@ class ChatLlama(BaseChatModel):
         return defaults
 
     def _build_payload(
-        self, messages: list[BaseMessage], stop: list[str] | None, **kwargs: Any
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None,
+        *,
+        stream: bool = False,
+        **kwargs: Any,
     ) -> dict[str, Any]:
+        stream_usage = kwargs.pop("stream_usage", self.stream_usage)
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [_convert_message(message) for message in messages],
@@ -382,7 +471,17 @@ class ChatLlama(BaseChatModel):
         }
         if stop is not None:
             payload["stop"] = stop
+        if stream:
+            payload["stream"] = True
+            if stream_usage:
+                payload["stream_options"] = {"include_usage": True}
         return payload
+
+    def _build_request(
+        self, method: str, path: str, payload: dict[str, Any] | None = None
+    ) -> httpx.Request:
+        url = self.base_url.rstrip("/") + path
+        return httpx.Request(method, url, json=payload)
 
     def _get_client(self) -> httpx.Client:
         if self.http_client is not None:
@@ -392,36 +491,109 @@ class ChatLlama(BaseChatModel):
             self._client = httpx.Client(timeout=self.timeout)
         return self._client
 
+    def _get_async_client(self) -> httpx.AsyncClient:
+        if self.http_async_client is not None:
+            return self.http_async_client
+        if self._async_client is None:
+            self._async_client = httpx.AsyncClient(timeout=self.timeout)
+        return self._async_client
+
     def _request(
         self, method: str, path: str, payload: dict[str, Any] | None = None
     ) -> httpx.Response:
-        """Send a request, retrying on errors core marks `is_retryable`."""
-        url = self.base_url.rstrip("/") + path
-        client = self._get_client()
+        request = self._build_request(method, path, payload)
+        return self._send(self._get_client(), request, stream=False)
+
+    async def _arequest(
+        self, method: str, path: str, payload: dict[str, Any] | None = None
+    ) -> httpx.Response:
+        request = self._build_request(method, path, payload)
+        return await self._asend(self._get_async_client(), request, stream=False)
+
+    def _send(
+        self, client: httpx.Client, request: httpx.Request, *, stream: bool
+    ) -> httpx.Response:
+        """Send, retrying on errors core marks `is_retryable`.
+
+        With `stream=True` this returns once the headers arrive, so retries only
+        cover the request itself; a failure mid-stream is raised, not retried.
+        """
         for attempt in range(self.max_retries + 1):
-            retry_after = None
             try:
-                response = client.request(method, url, json=payload)
+                response = client.send(request, stream=stream)
             except httpx.TransportError as exc:
-                error: Exception = error_from_transport(exc)
-                cause: Exception | None = exc
+                error, cause, retry_after = error_from_transport(exc), exc, None
             else:
                 if response.is_success:
                     return response
+                response.read()  # a streamed error body isn't read yet
+                response.close()
                 error, cause = error_from_response(response), None
                 retry_after = _retry_after(response)
-            retryable = isinstance(error, ModelError) and error.is_retryable
-            if not retryable or attempt == self.max_retries:
+            if not _is_retryable(error) or attempt == self.max_retries:
                 raise error from cause
             time.sleep(_retry_delay(attempt, retry_after))
         msg = "unreachable"  # the loop always returns or raises
         raise AssertionError(msg)
 
+    async def _asend(
+        self, client: httpx.AsyncClient, request: httpx.Request, *, stream: bool
+    ) -> httpx.Response:
+        """Async twin of `_send`."""
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = await client.send(request, stream=stream)
+            except httpx.TransportError as exc:
+                error, cause, retry_after = error_from_transport(exc), exc, None
+            else:
+                if response.is_success:
+                    return response
+                await response.aread()
+                await response.aclose()
+                error, cause = error_from_response(response), None
+                retry_after = _retry_after(response)
+            if not _is_retryable(error) or attempt == self.max_retries:
+                raise error from cause
+            await asyncio.sleep(_retry_delay(attempt, retry_after))
+        msg = "unreachable"
+        raise AssertionError(msg)
+
 
 # ChatLlama fields that configure the client rather than the request.
 _CLIENT_FIELDS = frozenset(
-    {"model", "base_url", "timeout", "max_retries", "http_client"}
+    {
+        "model",
+        "base_url",
+        "timeout",
+        "max_retries",
+        "streaming",
+        "stream_usage",
+        "http_client",
+        "http_async_client",
+    }
 )
+
+
+def _is_retryable(error: Exception) -> bool:
+    return isinstance(error, ModelError) and error.is_retryable
+
+
+def _sse_data(line: str) -> str | None:
+    """The payload of an SSE `data:` line; None for anything else.
+
+    Anything else is a blank separator, a `:` keep-alive ping, or another field.
+    """
+    if not line.startswith("data:"):
+        return None
+    return line[len("data:") :].strip()
+
+
+def _sse_event(data: str, response: httpx.Response) -> dict[str, Any]:
+    """Decode one event. An `error` event (failure mid-stream) is raised."""
+    event: dict[str, Any] = json.loads(data)
+    if "error" in event:
+        raise error_from_stream_event(event["error"], response)
+    return event
 
 
 def request_field_names() -> list[str]:
@@ -518,6 +690,71 @@ def _convert_response_message(message: Mapping[str, Any]) -> AIMessage:
         tool_calls=tool_calls,
         invalid_tool_calls=invalid_tool_calls,
     )
+
+
+def _convert_chunk(event: Mapping[str, Any]) -> ChatGenerationChunk | None:
+    """Convert one streamed `chat.completion.chunk` to a LangChain chunk.
+
+    Core merges chunks by concatenating string metadata (except `model_provider`
+    and `id`), so `finish_reason`, `model_name` and `system_fingerprint` go on
+    the finish chunk only.
+    """
+    choices: list[dict[str, Any]] = event.get("choices") or []
+    if not choices:
+        # The last chunk with `stream_options.include_usage`: usage and timings.
+        usage = event.get("usage")
+        timings = event.get("timings")
+        if usage is None and timings is None:
+            return None
+        response_metadata: dict[str, Any] = {"model_provider": MODEL_PROVIDER}
+        if timings is not None:
+            response_metadata["timings"] = timings
+        message = AIMessageChunk(
+            content="",
+            usage_metadata=_create_usage_metadata(usage) if usage else None,
+            response_metadata=response_metadata,
+        )
+        return ChatGenerationChunk(message=message)
+
+    choice = choices[0]
+    delta: Mapping[str, Any] = choice.get("delta") or {}
+    additional_kwargs: dict[str, Any] = {}
+    if reasoning := delta.get("reasoning_content"):
+        additional_kwargs["reasoning_content"] = reasoning
+    raw_tool_calls: list[dict[str, Any]] = delta.get("tool_calls") or []
+    tool_call_chunks: list[ToolCallChunk] = []
+    for raw in raw_tool_calls:
+        # The id and name arrive in the first fragment, the arguments in pieces.
+        function: Mapping[str, Any] = raw.get("function") or {}
+        tool_call_chunks.append(
+            create_tool_call_chunk(
+                name=function.get("name"),
+                args=function.get("arguments"),
+                id=raw.get("id"),
+                index=raw.get("index"),
+            )
+        )
+    message = AIMessageChunk(
+        content=delta.get("content") or "",
+        additional_kwargs=additional_kwargs,
+        tool_call_chunks=tool_call_chunks,
+        response_metadata={"model_provider": MODEL_PROVIDER},
+    )
+    generation_info: dict[str, Any] | None = None
+    if finish_reason := choice.get("finish_reason"):
+        generation_info = {
+            key: value
+            for key, value in {
+                "finish_reason": finish_reason,
+                "model_name": event.get("model"),
+                "system_fingerprint": event.get("system_fingerprint"),
+                "id": event.get("id"),
+            }.items()
+            if value is not None
+        }
+    if choice.get("logprobs"):
+        generation_info = {**(generation_info or {}), "logprobs": choice["logprobs"]}
+    return ChatGenerationChunk(message=message, generation_info=generation_info)
 
 
 def _create_usage_metadata(usage: Mapping[str, Any]) -> UsageMetadata:

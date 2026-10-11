@@ -17,9 +17,9 @@ A LangChain chat model (`ChatLlama`) for llama.cpp's `llama-server`, used direct
 - **Python** 3.10+. Dependencies: `langchain-core>=1.0,<2`, `httpx>=0.27,<1`.
 - **Milestones**, each ending with passing tests and a review:
   1. `invoke`: message conversion, reasoning, usage, `response_metadata`, clear errors for 400 overflow and 404.
-  2. `stream` and real async (`_stream`, `_agenerate`, `_astream`).
+  2. `stream` and real async (`_stream`, `_agenerate`, `_astream`), including streamed tool-call chunks (moved here from milestone 4 so streaming never drops tool calls).
   3. Structured output: `json_schema`, `function_calling`, `json_mode`, plus an opt-in flag that injects the schema into the prompt.
-  4. Tools: `bind_tools`, streamed tool-call chunks, `tool_choice` limited to what the server accepts. A small agent loop as the tool test.
+  4. Tools: `bind_tools`, `tool_choice` limited to what the server accepts. A small agent loop as the tool test.
   5. `langchain-tests` (unit and integration), run on several model families.
 
 ## Server behaviour the code depends on (llama-server b11429, verified)
@@ -41,6 +41,8 @@ A LangChain chat model (`ChatLlama`) for llama.cpp's `llama-server`, used direct
 - **Streaming:** SSE `data: {...}` and a final `data: [DONE]`.
   - Each `delta` carries `content`, `reasoning_content` or `tool_calls` fragments (`index`; the id and name come first, the arguments in pieces).
   - With `stream_options.include_usage`, a final chunk with `choices: []` carries `usage` and `timings`.
+  - Errors (b11429 `server-context.cpp:4731-4868`): an error before the first chunk is a normal HTTP error response; a later one arrives as `data: {"error": {...}}` and the stream ends without `[DONE]`. Lines starting with `:` are keep-alive pings (`sse_ping_interval`).
+  - Core concatenates string metadata when merging chunks (except `model_provider`, `id`, `output_version`), so `finish_reason`, `model_name` and `system_fingerprint` go on the finish chunk only.
 - **Errors:**
   - Prompt over the window: plain JSON (even when streaming) HTTP 400 `{"error":{"type":"exceed_context_size_error","message","n_prompt_tokens","n_ctx"}}`.
   - A reply that runs into the window: `finish_reason: "length"`. Nothing is truncated silently.

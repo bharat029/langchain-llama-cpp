@@ -114,6 +114,36 @@ def error_from_response(response: httpx.Response) -> httpx.HTTPStatusError:
     return cls(message, request=request, response=response)
 
 
+def error_from_stream_event(
+    detail: object, response: httpx.Response
+) -> httpx.HTTPStatusError:
+    """Build the error for a `data: {"error": ...}` event in a running stream.
+
+    The HTTP status was already 200, so the class comes from the event's
+    `type` and `code` (llama-server's `format_error_response`).
+    """
+    fields = _json_object(detail)
+    reason = fields.get("message") or detail or "error during streaming"
+    message = f"Error during streaming from {response.request.url}: {reason}"
+    request = response.request
+    code = fields.get("code")
+    if fields.get("type") == "exceed_context_size_error":
+        return LlamaContextOverflowError(
+            message,
+            request=request,
+            response=response,
+            n_prompt_tokens=fields.get("n_prompt_tokens"),
+            n_ctx=fields.get("n_ctx"),
+        )
+    if isinstance(code, int) and code in _STATUS_ERRORS:
+        cls = _STATUS_ERRORS[code]
+    elif isinstance(code, int) and 400 <= code < 500:  # noqa: PLR2004
+        cls = LlamaInvalidRequestError
+    else:
+        cls = LlamaAPIError
+    return cls(message, request=request, response=response)
+
+
 def _json_object(value: object) -> dict[str, Any]:
     """`value` if it's a JSON object, else an empty dict."""
     return cast("dict[str, Any]", value) if isinstance(value, dict) else {}
