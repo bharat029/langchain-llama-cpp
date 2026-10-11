@@ -5,7 +5,8 @@ import json
 import random
 import time
 from collections.abc import AsyncIterator, Iterator, Mapping
-from typing import Any, Literal
+from operator import itemgetter
+from typing import Any, Literal, cast
 
 import httpx
 from langchain_core.callbacks import (
@@ -13,12 +14,17 @@ from langchain_core.callbacks import (
     CallbackManagerForLLMRun,
 )
 from langchain_core.exceptions import ModelError, OutputParserException
-from langchain_core.language_models import BaseChatModel, LangSmithParams
+from langchain_core.language_models import (
+    BaseChatModel,
+    LangSmithParams,
+    LanguageModelInput,
+)
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
     BaseMessage,
     InvalidToolCall,
+    SystemMessage,
     ToolCall,
     convert_to_openai_messages,
 )
@@ -29,13 +35,34 @@ from langchain_core.messages.ai import (
 )
 from langchain_core.messages.tool import ToolCallChunk
 from langchain_core.messages.tool import tool_call_chunk as create_tool_call_chunk
+from langchain_core.output_parsers import (
+    JsonOutputKeyToolsParser,
+    JsonOutputParser,
+    PydanticOutputParser,
+    PydanticToolsParser,
+)
+from langchain_core.output_parsers.format_instructions import (
+    JSON_FORMAT_INSTRUCTIONS,
+)
 from langchain_core.output_parsers.openai_tools import (
     make_invalid_tool_call,
     parse_tool_call,
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from langchain_core.runnables import (
+    Runnable,
+    RunnableLambda,
+    RunnableMap,
+    RunnablePassthrough,
+)
 from langchain_core.utils import from_env
-from pydantic import Field, PrivateAttr
+from langchain_core.utils.function_calling import (
+    convert_to_json_schema,
+    convert_to_openai_function,
+    convert_to_openai_tool,
+)
+from langchain_core.utils.pydantic import is_basemodel_subclass
+from pydantic import BaseModel, Field, PrivateAttr
 
 from langchain_llama_cpp.exceptions import (
     error_from_response,
@@ -454,6 +481,138 @@ class ChatLlama(BaseChatModel):
         defaults["n_ctx"] = settings.get("n_ctx")
         return defaults
 
+    def with_structured_output(
+        self,
+        schema: dict[str, Any] | type | None = None,
+        *,
+        method: Literal[
+            "function_calling", "json_schema", "json_mode"
+        ] = "function_calling",
+        include_raw: bool = False,
+        strict: bool | None = None,
+        include_format_instructions: bool = False,
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, dict[str, Any] | BaseModel]:
+        """Return a runnable whose output is parsed into `schema`.
+
+        Args:
+            schema: A Pydantic class, a `TypedDict`, a JSON schema or an OpenAI
+                tool/function dict. Optional only for `method="json_mode"`.
+            method: How the server is asked for the structure:
+
+                - `"function_calling"` (default): the schema is the only tool,
+                  sent with `tool_choice: "required"` and
+                  `parallel_tool_calls: false`. The chat template shows the
+                  schema (with its descriptions) to the model, and the
+                  server's grammar constrains the arguments.
+                - `"json_schema"`: `response_format: {"type": "json_schema"}`.
+                  Grammar only: the model never sees the schema or its
+                  descriptions unless `include_format_instructions=True`.
+                - `"json_mode"`: `response_format: {"type": "json_object"}`,
+                  any JSON object.
+            include_raw: Return `{"raw", "parsed", "parsing_error"}` instead of
+                raising on a parsing error.
+            strict: Sent as `strict` in the tool or `json_schema` when set.
+                llama-server ignores it: its grammar always enforces the schema.
+            include_format_instructions: For `json_schema` and `json_mode`, add
+                core's format instructions for the schema to the system message
+                (after a leading system message's content, else as a new first
+                system message). Your messages are not modified.
+            **kwargs: Passed through to the request, like `bind`.
+
+        Returns:
+            A runnable that takes the model's input and returns an instance of
+            the Pydantic class, a dict, or the `include_raw` dict.
+
+        Raises:
+            ValueError: If `schema` is missing where it's needed, `method` is
+                unknown, or `include_format_instructions` is combined with
+                `function_calling`.
+        """
+        if method not in {"function_calling", "json_schema", "json_mode"}:
+            msg = (
+                "method must be 'function_calling', 'json_schema' or 'json_mode', "
+                f"got {method!r}"
+            )
+            raise ValueError(msg)
+        if include_format_instructions and method == "function_calling":
+            msg = (
+                "include_format_instructions applies to json_schema and json_mode; "
+                "with function_calling the chat template already shows the schema "
+                "to the model."
+            )
+            raise ValueError(msg)
+        if schema is None and (method != "json_mode" or include_format_instructions):
+            msg = f"schema is required for method={method!r}"
+            if include_format_instructions:
+                msg += " with include_format_instructions=True"
+            raise ValueError(msg)
+
+        pydantic_schema = (
+            cast("type[BaseModel]", schema)
+            if isinstance(schema, type) and is_basemodel_subclass(schema)
+            else None
+        )
+        ls_kwargs: dict[str, Any] = {"method": method}
+        if method != "json_mode":
+            ls_kwargs["strict"] = strict
+        ls_format = {"kwargs": ls_kwargs, "schema": schema}
+        llm: Runnable[LanguageModelInput, BaseMessage]
+        output_parser: Runnable[Any, Any]
+        if schema is not None and method == "function_calling":
+            tool = convert_to_openai_tool(schema, strict=strict)
+            llm = self.bind(
+                tools=[tool],
+                tool_choice="required",
+                parallel_tool_calls=False,
+                ls_structured_output_format=ls_format,
+                **kwargs,
+            )
+            output_parser = (
+                PydanticToolsParser(tools=[pydantic_schema], first_tool_only=True)
+                if pydantic_schema
+                else JsonOutputKeyToolsParser(
+                    key_name=tool["function"]["name"], first_tool_only=True
+                )
+            )
+        else:
+            response_format = (
+                _json_schema_response_format(schema, strict=strict)
+                if schema is not None and method == "json_schema"
+                else {"type": "json_object"}
+            )
+            llm = self.bind(
+                response_format=response_format,
+                ls_structured_output_format=ls_format,
+                **kwargs,
+            )
+            if schema is not None and include_format_instructions:
+                instructions = _format_instructions(schema)
+
+                def add_format_instructions(
+                    model_input: LanguageModelInput,
+                ) -> list[BaseMessage]:
+                    messages = self._convert_input(model_input).to_messages()
+                    return _add_to_system_message(messages, instructions)
+
+                llm = RunnableLambda(add_format_instructions) | llm
+            output_parser = (
+                PydanticOutputParser(pydantic_object=pydantic_schema)
+                if pydantic_schema
+                else JsonOutputParser()
+            )
+
+        if include_raw:
+            parser_assign = RunnablePassthrough.assign(
+                parsed=itemgetter("raw") | output_parser, parsing_error=lambda _: None
+            )
+            parser_none = RunnablePassthrough.assign(parsed=lambda _: None)
+            parser_with_fallback = parser_assign.with_fallbacks(
+                [parser_none], exception_key="parsing_error"
+            )
+            return RunnableMap(raw=llm) | parser_with_fallback
+        return llm | output_parser
+
     def _build_payload(
         self,
         messages: list[BaseMessage],
@@ -608,6 +767,56 @@ def request_field_names() -> list[str]:
         for name in ChatLlama.model_fields
         if name not in inherited and name not in _CLIENT_FIELDS
     ]
+
+
+def _json_schema_response_format(
+    schema: dict[str, Any] | type, *, strict: bool | None
+) -> dict[str, Any]:
+    """`response_format` for `json_schema`: `{name, description?, schema, strict?}`."""
+    function = convert_to_openai_function(schema)
+    json_schema: dict[str, Any] = {"name": function["name"]}
+    if description := function.get("description"):
+        json_schema["description"] = description
+    json_schema["schema"] = function["parameters"]
+    if strict is not None:
+        json_schema["strict"] = strict
+    return {"type": "json_schema", "json_schema": json_schema}
+
+
+def _format_instructions(schema: dict[str, Any] | type) -> str:
+    """Core's format instructions for `schema`.
+
+    Pydantic classes get `PydanticOutputParser.get_format_instructions()`. Other
+    schemas get the text `JsonOutputParser.get_format_instructions()` builds,
+    which it only does for Pydantic classes itself: the schema minus `title`
+    and `type`, in `JSON_FORMAT_INSTRUCTIONS`.
+    """
+    if isinstance(schema, type) and is_basemodel_subclass(schema):
+        return PydanticOutputParser(pydantic_object=schema).get_format_instructions()
+    reduced = convert_to_json_schema(schema)
+    reduced.pop("title", None)
+    reduced.pop("type", None)
+    return JSON_FORMAT_INSTRUCTIONS.format(
+        schema=json.dumps(reduced, ensure_ascii=False)
+    )
+
+
+def _add_to_system_message(
+    messages: list[BaseMessage], instructions: str
+) -> list[BaseMessage]:
+    """Append `instructions` to a leading system message, or insert one first.
+
+    Returns a new list; the caller's messages are left untouched.
+    """
+    if messages and isinstance(messages[0], SystemMessage):
+        system = messages[0]
+        content: str | list[str | dict[str, Any]]
+        if isinstance(system.content, str):
+            content = f"{system.content}\n\n{instructions}"
+        else:
+            content = [*system.content, {"type": "text", "text": instructions}]
+        return [system.model_copy(update={"content": content}), *messages[1:]]
+    return [SystemMessage(content=instructions), *messages]
 
 
 def _convert_message(message: BaseMessage) -> dict[str, Any]:

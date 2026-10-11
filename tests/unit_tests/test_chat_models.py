@@ -1,7 +1,7 @@
 import asyncio
 import json
 from collections.abc import Callable
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
 import pytest
@@ -9,6 +9,7 @@ from langchain_core.exceptions import (
     ContextOverflowError,
     ModelAPIError,
     ModelNotFoundError,
+    OutputParserException,
 )
 from langchain_core.messages import (
     AIMessage,
@@ -17,6 +18,12 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.output_parsers.format_instructions import (
+    JSON_FORMAT_INSTRUCTIONS,
+)
+from pydantic import BaseModel, Field
+from typing_extensions import TypedDict
 
 from langchain_llama_cpp import (
     ChatLlama,
@@ -730,3 +737,231 @@ def test_async_errors_are_mapped() -> None:
     server = Server(httpx.Response(400, json=OVERFLOW))
     with pytest.raises(LlamaContextOverflowError):
         asyncio.run(make_llm(server).ainvoke("long prompt"))
+
+
+# --- structured output -----------------------------------------------------
+
+
+class Age(BaseModel):
+    """A person's age."""
+
+    age: int = Field(description="The person's age in MONTHS, not years.")
+
+
+class AgeDict(TypedDict):
+    """A person's age."""
+
+    age: Annotated[int, ..., "The person's age in MONTHS, not years."]
+
+
+AGE_PROPERTY = {
+    "description": "The person's age in MONTHS, not years.",
+    "type": "integer",
+}
+AGE_PARAMETERS = {
+    "type": "object",
+    "properties": {"age": AGE_PROPERTY},
+    "required": ["age"],
+}
+
+
+def reply_with(message: dict[str, Any]) -> httpx.Response:
+    return ok({**REPLY, "choices": [{**REPLY["choices"][0], "message": message}]})
+
+
+def tool_call_reply(arguments: str, name: str = "Age") -> httpx.Response:
+    return reply_with(
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "2 years is 24 months.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }
+            ],
+        }
+    )
+
+
+def content_reply(content: str) -> httpx.Response:
+    return reply_with(
+        {"role": "assistant", "content": content, "reasoning_content": "Thinking."}
+    )
+
+
+def test_function_calling_is_the_default() -> None:
+    server = Server(tool_call_reply('{"age": 24}'))
+    result = make_llm(server).with_structured_output(Age).invoke("Alice is 2.")
+    assert result == Age(age=24)
+    body = server.bodies[0]
+    assert body["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "Age",
+                "description": "A person's age.",
+                "parameters": AGE_PARAMETERS,
+            },
+        }
+    ]
+    assert body["tool_choice"] == "required"  # a named-tool object becomes auto
+    assert body["parallel_tool_calls"] is False
+    assert "response_format" not in body
+    assert "ls_structured_output_format" not in body  # core strips it
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [AgeDict, {"title": "AgeDict", **AGE_PARAMETERS}],
+    ids=["typeddict", "json-schema"],
+)
+def test_function_calling_with_dict_schemas_returns_a_dict(schema: Any) -> None:
+    server = Server(tool_call_reply('{"age": 24}', name="AgeDict"))
+    result = make_llm(server).with_structured_output(schema).invoke("Alice is 2.")
+    assert result == {"age": 24}
+    assert server.bodies[0]["tools"][0]["function"]["name"] == "AgeDict"
+
+
+def test_strict_is_sent_only_when_set() -> None:
+    server = Server(
+        tool_call_reply('{"age": 24}'),
+        tool_call_reply('{"age": 24}'),
+        content_reply('{"age": 2}'),
+    )
+    llm = make_llm(server)
+    llm.with_structured_output(Age).invoke("x")
+    llm.with_structured_output(Age, strict=True).invoke("x")
+    llm.with_structured_output(Age, method="json_schema", strict=True).invoke("x")
+    assert "strict" not in server.bodies[0]["tools"][0]["function"]
+    assert server.bodies[1]["tools"][0]["function"]["strict"] is True
+    assert server.bodies[2]["response_format"]["json_schema"]["strict"] is True
+
+
+def test_json_schema_request_and_parse() -> None:
+    server = Server(content_reply('{"age": 2}'))
+    structured = make_llm(server).with_structured_output(Age, method="json_schema")
+    assert structured.invoke("Alice is 2.") == Age(age=2)
+    body = server.bodies[0]
+    assert body["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "Age",
+            "description": "A person's age.",
+            "schema": AGE_PARAMETERS,
+        },
+    }
+    assert "tools" not in body
+    assert body["messages"] == [{"role": "user", "content": "Alice is 2."}]
+
+
+def test_json_mode_without_schema_returns_a_dict() -> None:
+    server = Server(content_reply('{"age": 2, "name": "Alice"}'))
+    structured = make_llm(server).with_structured_output(method="json_mode")
+    assert structured.invoke("Alice is 2.") == {"age": 2, "name": "Alice"}
+    assert server.bodies[0]["response_format"] == {"type": "json_object"}
+
+
+def test_extra_kwargs_are_sent() -> None:
+    server = Server(content_reply('{"age": 2}'))
+    llm = make_llm(server)
+    llm.with_structured_output(Age, method="json_schema", temperature=0).invoke("x")
+    assert server.bodies[0]["temperature"] == 0
+
+
+def test_format_instructions_add_a_system_message() -> None:
+    server = Server(content_reply('{"age": 24}'))
+    structured = make_llm(server).with_structured_output(
+        Age, method="json_schema", include_format_instructions=True
+    )
+    assert structured.invoke("Alice is 2.") == Age(age=24)
+    instructions = PydanticOutputParser(pydantic_object=Age).get_format_instructions()
+    assert "MONTHS" in instructions
+    assert server.bodies[0]["messages"] == [
+        {"role": "system", "content": instructions},
+        {"role": "user", "content": "Alice is 2."},
+    ]
+
+
+def test_format_instructions_go_after_an_existing_system_message() -> None:
+    server = Server(content_reply('{"age": 24}'))
+    messages = [SystemMessage("Be brief."), HumanMessage("Alice is 2.")]
+    structured = make_llm(server).with_structured_output(
+        Age, method="json_mode", include_format_instructions=True
+    )
+    structured.invoke(messages)
+    instructions = PydanticOutputParser(pydantic_object=Age).get_format_instructions()
+    assert server.bodies[0]["messages"] == [
+        {"role": "system", "content": f"Be brief.\n\n{instructions}"},
+        {"role": "user", "content": "Alice is 2."},
+    ]
+    assert messages[0].content == "Be brief."  # the caller's messages are untouched
+
+
+def test_format_instructions_for_a_dict_schema() -> None:
+    server = Server(content_reply('{"age": 24}'))
+    structured = make_llm(server).with_structured_output(
+        AgeDict, method="json_schema", include_format_instructions=True
+    )
+    assert structured.invoke("Alice is 2.") == {"age": 24}
+    reduced = {
+        "description": "A person's age.",
+        "properties": {"age": AGE_PROPERTY},
+        "required": ["age"],
+    }
+    assert server.bodies[0]["messages"][0] == {
+        "role": "system",
+        "content": JSON_FORMAT_INSTRUCTIONS.format(schema=json.dumps(reduced)),
+    }
+
+
+@pytest.mark.parametrize(
+    ("schema", "kwargs", "match"),
+    [
+        (Age, {"include_format_instructions": True}, "function_calling"),
+        (None, {}, "schema is required"),
+        (None, {"method": "json_schema"}, "schema is required"),
+        (
+            None,
+            {"method": "json_mode", "include_format_instructions": True},
+            "schema is required",
+        ),
+        (Age, {"method": "tools"}, "method must be"),
+    ],
+)
+def test_invalid_arguments(schema: Any, kwargs: dict[str, Any], match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        make_llm(Server()).with_structured_output(schema, **kwargs)
+
+
+def test_include_raw_keeps_the_message_and_the_parsing_error() -> None:
+    server = Server(content_reply("not json"))
+    structured = make_llm(server).with_structured_output(
+        Age, method="json_schema", include_raw=True
+    )
+    result = structured.invoke("Alice is 2.")
+    assert isinstance(result, dict)
+    assert isinstance(result["raw"], AIMessage)
+    assert result["raw"].additional_kwargs["reasoning_content"] == "Thinking."
+    assert result["parsed"] is None
+    assert isinstance(result["parsing_error"], OutputParserException)
+
+
+def test_include_raw_on_success() -> None:
+    server = Server(tool_call_reply('{"age": 24}'))
+    structured = make_llm(server).with_structured_output(Age, include_raw=True)
+    result = structured.invoke("Alice is 2.")
+    assert isinstance(result, dict)
+    assert result["parsed"] == Age(age=24)
+    assert result["parsing_error"] is None
+
+
+def test_structured_ainvoke() -> None:
+    server = Server(content_reply('{"age": 2}'))
+    structured = make_llm(server).with_structured_output(
+        Age, method="json_schema", include_format_instructions=True
+    )
+    assert asyncio.run(structured.ainvoke("Alice is 2.")) == Age(age=2)
+    assert server.bodies[0]["messages"][0]["role"] == "system"
