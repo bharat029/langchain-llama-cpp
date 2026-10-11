@@ -1,6 +1,6 @@
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Annotated, Any
 
 import httpx
@@ -9,6 +9,7 @@ from langchain_core.exceptions import (
     ContextOverflowError,
     ModelAPIError,
     ModelNotFoundError,
+    ModelTimeoutError,
     OutputParserException,
 )
 from langchain_core.messages import (
@@ -24,7 +25,7 @@ from langchain_core.output_parsers.format_instructions import (
     JSON_FORMAT_INSTRUCTIONS,
 )
 from langchain_core.tools import tool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from typing_extensions import TypedDict
 
 from langchain_llama_cpp import (
@@ -34,6 +35,7 @@ from langchain_llama_cpp import (
     LlamaContextOverflowError,
     LlamaInvalidRequestError,
     LlamaModelNotFoundError,
+    LlamaTimeoutError,
 )
 from langchain_llama_cpp import chat_models as chat_models_module
 from langchain_llama_cpp.chat_models import request_field_names
@@ -1159,7 +1161,7 @@ def test_v1_stream_keeps_a_tool_call_after_reasoning() -> None:
         delta(finish_reason="tool_calls"),
     )
     assert msg.content == [
-        {"type": "reasoning", "reasoning": "Use the tool.", "index": "lc_rs"},
+        {"type": "reasoning", "reasoning": "Use the tool.", "index": 0},
         MAGIC_CALL,
     ]
     assert msg.content_blocks == msg.content
@@ -1174,7 +1176,7 @@ def test_v1_stream_keeps_a_tool_call_after_text() -> None:
         delta(finish_reason="tool_calls"),
     )
     assert msg.content == [
-        {"type": "text", "text": "Let me check.", "index": "lc_txt"},
+        {"type": "text", "text": "Let me check.", "index": 0},
         MAGIC_CALL,
     ]
 
@@ -1223,3 +1225,186 @@ def test_v0_content_blocks_are_core_defaults() -> None:
         {"type": "reasoning", "reasoning": "2 years is 24 months."},
         {"type": "tool_call", "id": "call_1", "name": "Age", "args": {"age": 24}},
     ]
+
+
+# --- review fixes ----------------------------------------------------------
+
+
+def test_invoke_with_stream_kwarg_streams() -> None:
+    server = Server(sse(*EVENTS))
+    assert make_llm(server).invoke("hi", stream=True).content == "391"
+    assert server.bodies[0]["stream"] is True
+
+
+def test_ainvoke_with_stream_kwarg_streams() -> None:
+    server = Server(sse(*EVENTS))
+    msg = asyncio.run(make_llm(server).ainvoke("hi", stream=True))
+    assert msg.content == "391"
+    assert server.bodies[0]["stream"] is True
+
+
+def test_stream_false_kwarg_is_not_sent() -> None:
+    server = Server(ok())
+    make_llm(server).invoke("hi", stream=False)
+    assert "stream" not in server.bodies[0]
+
+
+def test_async_client_is_replaced_on_a_new_event_loop() -> None:
+    llm = ChatLlama(model="gemma", base_url=BASE_URL)
+
+    async def client_twice() -> tuple[httpx.AsyncClient, httpx.AsyncClient]:
+        return llm._get_async_client(), llm._get_async_client()
+
+    first, same = asyncio.run(client_twice())
+    second, _ = asyncio.run(client_twice())
+    assert first is same  # reused within one loop
+    assert second is not first  # not carried over to a closed loop
+
+
+class BrokenStream(httpx.SyncByteStream, httpx.AsyncByteStream):
+    """One chunk, then the connection fails."""
+
+    first = f"data: {json.dumps(delta(content='39'))}\n\n".encode()
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield self.first
+        msg = "read timed out"
+        raise httpx.ReadTimeout(msg)
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self.first
+        msg = "read timed out"
+        raise httpx.ReadTimeout(msg)
+
+
+def test_transport_error_mid_stream_is_wrapped() -> None:
+    llm = make_llm(Server(httpx.Response(200, stream=BrokenStream())))
+    with pytest.raises(LlamaTimeoutError) as info:
+        list(llm.stream("hi"))
+    assert isinstance(info.value, ModelTimeoutError)
+    assert isinstance(info.value.__cause__, httpx.ReadTimeout)
+
+
+def test_transport_error_mid_astream_is_wrapped() -> None:
+    llm = make_llm(Server(httpx.Response(200, stream=BrokenStream())))
+
+    async def collect() -> list[AIMessageChunk]:
+        return [chunk async for chunk in llm.astream("hi")]
+
+    with pytest.raises(LlamaTimeoutError):
+        asyncio.run(collect())
+
+
+def test_streaming_with_n_above_1_is_refused() -> None:
+    with pytest.raises(ValueError, match="n must be 1 when streaming"):
+        list(make_llm(Server(), n=2).stream("hi"))
+    per_call: dict[str, Any] = {"n": 3}
+    with pytest.raises(ValueError, match="n must be 1 when streaming"):
+        list(make_llm(Server()).stream("hi", **per_call))
+
+
+def test_content_blocks_do_not_modify_the_message() -> None:
+    chunk = AIMessageChunk(
+        content=[{"type": "text", "text": "hi"}],
+        tool_call_chunks=[
+            {
+                "name": "f",
+                "args": "{}",
+                "id": "c1",
+                "index": 0,
+                "type": "tool_call_chunk",
+            }
+        ],
+        response_metadata={"model_provider": "llama-cpp"},
+    )
+    blocks = chunk.content_blocks
+    assert chunk.content == [{"type": "text", "text": "hi"}]
+    assert blocks[-1].get("index") == "lc_tc_0"
+
+
+def test_v1_stream_keeps_text_after_a_tool_call_in_order() -> None:
+    msg = stream_v1(
+        delta(content="Checking."),
+        tool_call_delta(0, call_id="call_1", name="magic_function"),
+        tool_call_delta(0, args='{"input": 3}'),
+        delta(content="Done."),
+        delta(finish_reason="tool_calls"),
+    )
+    assert [block["type"] for block in msg.content_blocks] == [
+        "text",
+        "tool_call",
+        "text",
+    ]
+    texts = [b.get("text") for b in msg.content_blocks if b["type"] == "text"]
+    assert texts == ["Checking.", "Done."]
+
+
+def test_v1_stream_text_and_tool_call_in_one_delta() -> None:
+    first = tool_call_delta(0, call_id="call_1", name="magic_function", args='{"in')
+    first["choices"][0]["delta"]["content"] = "Calling."
+    msg = stream_v1(
+        first,
+        tool_call_delta(0, args='put": 3}'),
+        delta(finish_reason="tool_calls"),
+    )
+    assert [block["type"] for block in msg.content_blocks] == ["text", "tool_call"]
+    assert msg.content_blocks[1] == MAGIC_CALL
+
+
+def test_bind_tools_with_a_non_function_tool() -> None:
+    server = Server(weather_call_reply())
+    tools = [get_weather, {"type": "web_search"}]
+    make_llm(server).bind_tools(tools, tool_choice="get_weather").invoke("x")
+    assert server.bodies[0]["tool_choice"] == "required"
+    assert server.bodies[0]["tools"][1] == {"type": "web_search"}
+
+
+def test_empty_tool_choice_is_left_out() -> None:
+    server = Server(weather_call_reply())
+    make_llm(server).bind_tools([get_weather], tool_choice="").invoke("x")
+    assert "tool_choice" not in server.bodies[0]
+
+
+INNER_SCHEMA = {"name": "Age", "schema": AGE_PARAMETERS, "strict": True}
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [INNER_SCHEMA, {"type": "json_schema", "json_schema": INNER_SCHEMA}],
+    ids=["name-schema", "response-format"],
+)
+def test_json_schema_accepts_openai_response_format_shapes(schema: Any) -> None:
+    server = Server(content_reply('{"age": 24}'))
+    structured = make_llm(server).with_structured_output(
+        schema, method="json_schema", include_format_instructions=True
+    )
+    assert structured.invoke("Alice is 2.") == {"age": 24}
+    body = server.bodies[0]
+    assert body["response_format"] == {
+        "type": "json_schema",
+        "json_schema": INNER_SCHEMA,
+    }
+    reduced = {"properties": {"age": AGE_PROPERTY}, "required": ["age"]}
+    assert body["messages"][0]["content"] == JSON_FORMAT_INSTRUCTIONS.format(
+        schema=json.dumps(reduced)
+    )
+
+
+def test_structured_output_kwargs_override_defaults() -> None:
+    server = Server(tool_call_reply('{"age": 24}'))
+    llm = make_llm(server)
+    llm.with_structured_output(
+        Age, parallel_tool_calls=True, tool_choice="auto"
+    ).invoke("x")
+    assert server.bodies[0]["tool_choice"] == "auto"
+    assert server.bodies[0]["parallel_tool_calls"] is True
+
+
+def test_structured_output_rejects_extra_tools() -> None:
+    with pytest.raises(ValueError, match="only tool"):
+        make_llm(Server()).with_structured_output(Age, tools=[get_weather])
+
+
+def test_negative_max_retries_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        ChatLlama(model="gemma", base_url=BASE_URL, max_retries=-1)

@@ -319,7 +319,7 @@ class ChatLlama(BaseChatModel):
     timeout: float | httpx.Timeout | None = None
     """Request timeout in seconds. `None` (the default) means no timeout."""
 
-    max_retries: int = 2
+    max_retries: int = Field(default=2, ge=0)
     """Retries for connection errors, timeouts, 429 and 5xx. 0 turns them off."""
 
     streaming: bool = False
@@ -339,7 +339,10 @@ class ChatLlama(BaseChatModel):
     """Your own `httpx.AsyncClient` for async calls. `timeout` isn't applied to it."""
 
     _client: httpx.Client | None = PrivateAttr(default=None)
+    # An AsyncClient's pooled connections belong to the event loop that opened
+    # them, so the cached client is replaced when a call runs on another loop.
     _async_client: httpx.AsyncClient | None = PrivateAttr(default=None)
+    _async_client_loop: asyncio.AbstractEventLoop | None = PrivateAttr(default=None)
 
     @property
     def _llm_type(self) -> str:
@@ -418,7 +421,7 @@ class ChatLlama(BaseChatModel):
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
         # Core calls run_manager.on_llm_new_token for each chunk itself.
-        payload = self._build_payload(messages, stop, stream=True, **kwargs)
+        payload = self._build_payload(messages, stop, streaming=True, **kwargs)
         request = self._build_request("POST", CHAT_COMPLETIONS, payload)
         response = self._send(self._get_client(), request, stream=True)
         try:
@@ -430,6 +433,8 @@ class ChatLlama(BaseChatModel):
                     break
                 if chunk := _convert_chunk(_sse_event(data, response)):
                     yield chunk
+        except httpx.TransportError as exc:  # the connection broke mid-stream
+            raise error_from_transport(exc) from exc
         finally:
             response.close()  # also when the caller stops early
 
@@ -440,7 +445,7 @@ class ChatLlama(BaseChatModel):
         run_manager: AsyncCallbackManagerForLLMRun | None = None,  # noqa: ARG002
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
-        payload = self._build_payload(messages, stop, stream=True, **kwargs)
+        payload = self._build_payload(messages, stop, streaming=True, **kwargs)
         request = self._build_request("POST", CHAT_COMPLETIONS, payload)
         client = self._get_async_client()
         response = await self._asend(client, request, stream=True)
@@ -453,6 +458,8 @@ class ChatLlama(BaseChatModel):
                     break
                 if chunk := _convert_chunk(_sse_event(data, response)):
                     yield chunk
+        except httpx.TransportError as exc:
+            raise error_from_transport(exc) from exc
         finally:
             await response.aclose()
 
@@ -504,7 +511,8 @@ class ChatLlama(BaseChatModel):
                 `{"type": "function", "function": {"name": ...}}`, also becomes
                 `"required"`: the server can't force one particular tool (it
                 turns the object form into `"auto"`), so the model must call a
-                tool but may pick another one. `None` and `False` leave it out.
+                tool but may pick another one. `None`, `False` and `""` leave
+                it out.
 
                 How strictly `"required"` holds depends on the chat handler
                 llama-server picks for the model's template. For Qwen3.5/3.6
@@ -528,8 +536,12 @@ class ChatLlama(BaseChatModel):
         formatted_tools = [
             convert_to_openai_tool(tool, strict=strict) for tool in tools
         ]
-        if tool_choice is not None and tool_choice is not False:
-            tool_names = [tool["function"]["name"] for tool in formatted_tools]
+        if tool_choice:  # None, False and "" leave it out, as in ChatOpenAI
+            tool_names = [
+                tool["function"]["name"]
+                for tool in formatted_tools
+                if "function" in tool
+            ]
             kwargs["tool_choice"] = _tool_choice(
                 tool_choice=tool_choice, tool_names=tool_names
             )
@@ -587,25 +599,12 @@ class ChatLlama(BaseChatModel):
                 unknown, or `include_format_instructions` is combined with
                 `function_calling`.
         """
-        if method not in {"function_calling", "json_schema", "json_mode"}:
-            msg = (
-                "method must be 'function_calling', 'json_schema' or 'json_mode', "
-                f"got {method!r}"
-            )
-            raise ValueError(msg)
-        if include_format_instructions and method == "function_calling":
-            msg = (
-                "include_format_instructions applies to json_schema and json_mode; "
-                "with function_calling the chat template already shows the schema "
-                "to the model."
-            )
-            raise ValueError(msg)
-        if schema is None and (method != "json_mode" or include_format_instructions):
-            msg = f"schema is required for method={method!r}"
-            if include_format_instructions:
-                msg += " with include_format_instructions=True"
-            raise ValueError(msg)
-
+        _check_structured_output_args(
+            schema,
+            method=method,
+            include_format_instructions=include_format_instructions,
+            kwargs=kwargs,
+        )
         pydantic_schema = (
             cast("type[BaseModel]", schema)
             if isinstance(schema, type) and is_basemodel_subclass(schema)
@@ -619,13 +618,14 @@ class ChatLlama(BaseChatModel):
         output_parser: Runnable[Any, Any]
         if schema is not None and method == "function_calling":
             tool = convert_to_openai_tool(schema, strict=strict)
-            llm = self.bind_tools(
-                [tool],
-                tool_choice="required",
-                parallel_tool_calls=False,
-                ls_structured_output_format=ls_format,
+            # The caller's kwargs win over our defaults, as in ChatOpenAI.
+            bind_kwargs: dict[str, Any] = {
+                "tool_choice": "required",
+                "parallel_tool_calls": False,
+                "ls_structured_output_format": ls_format,
                 **kwargs,
-            )
+            }
+            llm = self.bind_tools([tool], **bind_kwargs)
             output_parser = (
                 PydanticToolsParser(tools=[pydantic_schema], first_tool_only=True)
                 if pydantic_schema
@@ -640,9 +640,11 @@ class ChatLlama(BaseChatModel):
                 else {"type": "json_object"}
             )
             llm = self.bind(
-                response_format=response_format,
-                ls_structured_output_format=ls_format,
-                **kwargs,
+                **{
+                    "response_format": response_format,
+                    "ls_structured_output_format": ls_format,
+                    **kwargs,
+                }
             )
             if schema is not None and include_format_instructions:
                 instructions = _format_instructions(schema)
@@ -676,10 +678,12 @@ class ChatLlama(BaseChatModel):
         messages: list[BaseMessage],
         stop: list[str] | None,
         *,
-        stream: bool = False,
+        streaming: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         stream_usage = kwargs.pop("stream_usage", self.stream_usage)
+        # Core leaves `invoke(..., stream=True)` in kwargs; `streaming` decides.
+        kwargs.pop("stream", None)
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [_convert_message(message) for message in messages],
@@ -688,7 +692,11 @@ class ChatLlama(BaseChatModel):
         }
         if stop is not None:
             payload["stop"] = stop
-        if stream:
+        if streaming:
+            # Chunks would interleave completions; ChatOpenAI refuses this too.
+            if (payload.get("n") or 1) > 1:
+                msg = "n must be 1 when streaming."
+                raise ValueError(msg)
             payload["stream"] = True
             if stream_usage:
                 payload["stream_options"] = {"include_usage": True}
@@ -711,8 +719,10 @@ class ChatLlama(BaseChatModel):
     def _get_async_client(self) -> httpx.AsyncClient:
         if self.http_async_client is not None:
             return self.http_async_client
-        if self._async_client is None:
+        loop = asyncio.get_running_loop()
+        if self._async_client is None or self._async_client_loop is not loop:
             self._async_client = httpx.AsyncClient(timeout=self.timeout)
+            self._async_client_loop = loop
         return self._async_client
 
     def _request(
@@ -853,18 +863,70 @@ def _tool_choice(
     raise ValueError(msg)
 
 
+def _check_structured_output_args(
+    schema: dict[str, Any] | type | None,
+    *,
+    method: str,
+    include_format_instructions: bool,
+    kwargs: Mapping[str, Any],
+) -> None:
+    """Raise `ValueError` for argument combinations `with_structured_output` rejects."""
+    if method not in {"function_calling", "json_schema", "json_mode"}:
+        msg = (
+            "method must be 'function_calling', 'json_schema' or 'json_mode', "
+            f"got {method!r}"
+        )
+        raise ValueError(msg)
+    if include_format_instructions and method == "function_calling":
+        msg = (
+            "include_format_instructions applies to json_schema and json_mode; "
+            "with function_calling the chat template already shows the schema "
+            "to the model."
+        )
+        raise ValueError(msg)
+    if schema is None and (method != "json_mode" or include_format_instructions):
+        msg = f"schema is required for method={method!r}"
+        if include_format_instructions:
+            msg += " with include_format_instructions=True"
+        raise ValueError(msg)
+    if method == "function_calling" and "tools" in kwargs:
+        msg = "with_structured_output binds the schema as the only tool"
+        raise ValueError(msg)
+
+
 def _json_schema_response_format(
     schema: dict[str, Any] | type, *, strict: bool | None
 ) -> dict[str, Any]:
     """`response_format` for `json_schema`: `{name, description?, schema, strict?}`."""
-    function = convert_to_openai_function(schema)
-    json_schema: dict[str, Any] = {"name": function["name"]}
-    if description := function.get("description"):
-        json_schema["description"] = description
-    json_schema["schema"] = function["parameters"]
+    if (given := _given_json_schema(schema)) is not None:
+        json_schema = dict(given)
+    else:
+        function = convert_to_openai_function(schema)
+        json_schema = {"name": function["name"]}
+        if description := function.get("description"):
+            json_schema["description"] = description
+        json_schema["schema"] = function["parameters"]
     if strict is not None:
         json_schema["strict"] = strict
     return {"type": "json_schema", "json_schema": json_schema}
+
+
+def _given_json_schema(schema: dict[str, Any] | type) -> dict[str, Any] | None:
+    """The `{name, schema, ...}` part of a schema already in OpenAI's shape.
+
+    Accepts the two shapes ChatOpenAI does: a whole `response_format`
+    (`{"type": "json_schema", "json_schema": {...}}`) and its inner
+    `{"name": ..., "schema": ...}`. Anything else returns None.
+    """
+    if not isinstance(schema, dict):
+        return None
+    if schema.get("type") == "json_schema" and isinstance(
+        inner := schema.get("json_schema"), dict
+    ):
+        return cast("dict[str, Any]", inner)
+    if "name" in schema and isinstance(schema.get("schema"), dict):
+        return schema
+    return None
 
 
 def _format_instructions(schema: dict[str, Any] | type) -> str:
@@ -877,7 +939,10 @@ def _format_instructions(schema: dict[str, Any] | type) -> str:
     """
     if isinstance(schema, type) and is_basemodel_subclass(schema):
         return PydanticOutputParser(pydantic_object=schema).get_format_instructions()
-    reduced = convert_to_json_schema(schema)
+    if (given := _given_json_schema(schema)) is not None:
+        reduced = dict(given["schema"])
+    else:
+        reduced = convert_to_json_schema(schema)
     reduced.pop("title", None)
     reduced.pop("type", None)
     return JSON_FORMAT_INSTRUCTIONS.format(
