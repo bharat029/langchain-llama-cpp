@@ -53,6 +53,9 @@ ignore = [
     "TC003",
     "RUF012",  # Mutable class defaults: false positives on pydantic models
     "PLR0913", # Too many arguments: chat models have many parameters
+    "C901",    # Complexity, branch and statement limits: single-use logic is
+    "PLR0912", # inlined instead of split into helpers (as langchain-openai and
+    "PLR0915", # langchain-ollama)
     "PERF203", # try/except in a loop: rarely useful (as langchain-ollama)
     "FIX002",  # TODOs are allowed
     "TD002",

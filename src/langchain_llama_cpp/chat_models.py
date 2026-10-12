@@ -457,8 +457,9 @@ class ChatLlama(BaseChatModel):
         """
         response = self._send("GET", f"/upstream/{self.model}/props")
         settings: dict[str, Any] = response.json()["default_generation_settings"]
+        # Undo float32 noise: 0.949999988079071 -> 0.95.
         defaults = {
-            key: _round_float32(value)
+            key: float(f"{value:.7g}") if isinstance(value, float) else value
             for key, value in settings.get("params", {}).items()
         }
         defaults["n_ctx"] = settings.get("n_ctx")
@@ -516,9 +517,28 @@ class ChatLlama(BaseChatModel):
                 for tool in formatted_tools
                 if "function" in tool
             ]
-            kwargs["tool_choice"] = _tool_choice(
-                tool_choice=tool_choice, tool_names=tool_names
-            )
+            # llama-server takes only these strings. It turns the object form
+            # into "auto" (b11429), so a named tool becomes "required".
+            if tool_choice is True or tool_choice == "any":
+                tool_choice = "required"
+            elif not (
+                isinstance(tool_choice, str)
+                and tool_choice in {"auto", "none", "required"}
+            ):
+                name: object = tool_choice
+                if isinstance(tool_choice, dict):
+                    function: object = tool_choice.get("function")
+                    if isinstance(function, dict):
+                        name = cast("dict[str, Any]", function).get("name")
+                if not (isinstance(name, str) and name in tool_names):
+                    msg = (
+                        "tool_choice must be 'auto', 'none', 'required', 'any', "
+                        "True, or the name of a bound tool "
+                        f"({', '.join(tool_names)}); got {tool_choice!r}"
+                    )
+                    raise ValueError(msg)
+                tool_choice = "required"
+            kwargs["tool_choice"] = tool_choice
         if parallel_tool_calls is not None:
             kwargs["parallel_tool_calls"] = parallel_tool_calls
         return self.bind(tools=formatted_tools, **kwargs)
@@ -573,12 +593,27 @@ class ChatLlama(BaseChatModel):
                 unknown, or `include_format_instructions` is combined with
                 `function_calling`.
         """
-        _check_structured_output_args(
-            schema,
-            method=method,
-            include_format_instructions=include_format_instructions,
-            kwargs=kwargs,
-        )
+        if method not in {"function_calling", "json_schema", "json_mode"}:
+            msg = (
+                "method must be 'function_calling', 'json_schema' or 'json_mode', "
+                f"got {method!r}"
+            )
+            raise ValueError(msg)
+        if include_format_instructions and method == "function_calling":
+            msg = (
+                "include_format_instructions applies to json_schema and json_mode; "
+                "with function_calling the chat template already shows the schema "
+                "to the model."
+            )
+            raise ValueError(msg)
+        if schema is None and (method != "json_mode" or include_format_instructions):
+            msg = f"schema is required for method={method!r}"
+            if include_format_instructions:
+                msg += " with include_format_instructions=True"
+            raise ValueError(msg)
+        if method == "function_calling" and "tools" in kwargs:
+            msg = "with_structured_output binds the schema as the only tool"
+            raise ValueError(msg)
         pydantic_schema = (
             cast("type[BaseModel]", schema)
             if isinstance(schema, type) and is_basemodel_subclass(schema)
@@ -631,8 +666,22 @@ class ChatLlama(BaseChatModel):
                 def add_format_instructions(
                     model_input: LanguageModelInput,
                 ) -> list[BaseMessage]:
+                    """Append to a leading system message, or insert one first.
+
+                    Returns a new list; the caller's messages are left untouched.
+                    """
                     messages = self._convert_input(model_input).to_messages()
-                    return _add_to_system_message(messages, instructions)
+                    if not (messages and isinstance(messages[0], SystemMessage)):
+                        return [SystemMessage(content=instructions), *messages]
+                    system = messages[0]
+                    content: str | list[str | dict[str, Any]]
+                    if isinstance(system.content, str):
+                        content = f"{system.content}\n\n{instructions}"
+                    else:
+                        text = {"type": "text", "text": instructions}
+                        content = [*system.content, text]
+                    update = {"content": content}
+                    return [system.model_copy(update=update), *messages[1:]]
 
                 llm = RunnableLambda(add_format_instructions) | llm
             output_parser = (
@@ -884,16 +933,22 @@ class ChatLlama(BaseChatModel):
     ) -> float:
         """Seconds to wait before retrying `error`, or raise it if it's final.
 
-        An HTTP error's response supplies `Retry-After`.
+        Retried: the errors core marks `is_retryable` (connection, timeout, 429
+        and 5xx). A numeric `Retry-After` up to `MAX_RETRY_AFTER` wins over the
+        exponential backoff.
         """
-        if not _is_retryable(error) or attempt >= self.max_retries:
+        retryable = isinstance(error, ModelError) and error.is_retryable
+        if not retryable or attempt >= self.max_retries:
             raise error from cause
-        retry_after = (
-            _retry_after(error.response)
-            if isinstance(error, httpx.HTTPStatusError)
-            else None
-        )
-        return _retry_delay(attempt, retry_after)
+        if isinstance(error, httpx.HTTPStatusError):
+            try:
+                retry_after = float(error.response.headers.get("retry-after", ""))
+            except ValueError:  # missing, or an HTTP date
+                retry_after = None
+            if retry_after is not None and 0 <= retry_after <= MAX_RETRY_AFTER:
+                return retry_after
+        delay = min(INITIAL_RETRY_DELAY * 2**attempt, MAX_RETRY_DELAY)
+        return delay * (1 - 0.25 * random.random())  # noqa: S311 (jitter, not crypto)
 
 
 # --- Public functions -----------------------------------------------------
@@ -948,63 +1003,6 @@ def _without_none(**items: Any) -> dict[str, Any]:
 
 
 # --- Tools and structured output ------------------------------------------
-
-
-def _tool_choice(
-    *, tool_choice: dict[str, Any] | str | bool, tool_names: list[str]
-) -> str:
-    """Map a LangChain `tool_choice` to one of the strings llama-server accepts.
-
-    A named tool becomes `"required"`: llama-server turns the object form into
-    `"auto"` (b11429), so `"required"` is the closest it can do.
-    """
-    if tool_choice is True or tool_choice == "any":
-        return "required"
-    if isinstance(tool_choice, str) and tool_choice in {"auto", "none", "required"}:
-        return tool_choice
-    name: object = tool_choice
-    if isinstance(tool_choice, dict):
-        function: object = tool_choice.get("function")
-        if isinstance(function, dict):
-            name = cast("dict[str, Any]", function).get("name")
-    if isinstance(name, str) and name in tool_names:
-        return "required"
-    msg = (
-        "tool_choice must be 'auto', 'none', 'required', 'any', True, or the "
-        f"name of a bound tool ({', '.join(tool_names)}); got {tool_choice!r}"
-    )
-    raise ValueError(msg)
-
-
-def _check_structured_output_args(
-    schema: dict[str, Any] | type | None,
-    *,
-    method: str,
-    include_format_instructions: bool,
-    kwargs: Mapping[str, Any],
-) -> None:
-    """Raise `ValueError` for argument combinations `with_structured_output` rejects."""
-    if method not in {"function_calling", "json_schema", "json_mode"}:
-        msg = (
-            "method must be 'function_calling', 'json_schema' or 'json_mode', "
-            f"got {method!r}"
-        )
-        raise ValueError(msg)
-    if include_format_instructions and method == "function_calling":
-        msg = (
-            "include_format_instructions applies to json_schema and json_mode; "
-            "with function_calling the chat template already shows the schema "
-            "to the model."
-        )
-        raise ValueError(msg)
-    if schema is None and (method != "json_mode" or include_format_instructions):
-        msg = f"schema is required for method={method!r}"
-        if include_format_instructions:
-            msg += " with include_format_instructions=True"
-        raise ValueError(msg)
-    if method == "function_calling" and "tools" in kwargs:
-        msg = "with_structured_output binds the schema as the only tool"
-        raise ValueError(msg)
 
 
 def _json_schema_response_format(
@@ -1092,24 +1090,6 @@ def _format_instructions(schema: dict[str, Any] | type) -> str:
     return JSON_FORMAT_INSTRUCTIONS.format(
         schema=json.dumps(reduced, ensure_ascii=False)
     )
-
-
-def _add_to_system_message(
-    messages: list[BaseMessage], instructions: str
-) -> list[BaseMessage]:
-    """Append `instructions` to a leading system message, or insert one first.
-
-    Returns a new list; the caller's messages are left untouched.
-    """
-    if messages and isinstance(messages[0], SystemMessage):
-        system = messages[0]
-        content: str | list[str | dict[str, Any]]
-        if isinstance(system.content, str):
-            content = f"{system.content}\n\n{instructions}"
-        else:
-            content = [*system.content, {"type": "text", "text": instructions}]
-        return [system.model_copy(update={"content": content}), *messages[1:]]
-    return [SystemMessage(content=instructions), *messages]
 
 
 # --- Replies --------------------------------------------------------------
@@ -1222,30 +1202,17 @@ def _add_usage(total: dict[str, Any], usage: Mapping[str, Any]) -> None:
 
 
 def _chunk_from_line(line: str, response: httpx.Response) -> ChatGenerationChunk | None:
-    """The chunk for one SSE line: None to skip the line, `_DONE` at the end."""
-    data = _sse_data(line)
-    if data is None:
-        return None
-    if data == "[DONE]":
-        return _DONE
-    return _convert_chunk(_sse_event(data, response))
+    """The chunk for one SSE line: None to skip the line, `_DONE` at the end.
 
-
-def _sse_data(line: str) -> str | None:
-    """The payload of an SSE `data:` line; None for anything else.
-
-    Anything else is a blank separator, a `:` keep-alive ping, or another field.
+    Lines other than `data:` (blank separators, `:` keep-alive pings) are
+    skipped. An `error` event (a failure mid-stream) is raised, and so is data
+    that isn't a JSON object, as an API error.
     """
     if not line.startswith("data:"):
         return None
-    return line[len("data:") :].strip()
-
-
-def _sse_event(data: str, response: httpx.Response) -> LlamaChunk:
-    """Decode one event. An `error` event (failure mid-stream) is raised.
-
-    So is data that isn't a JSON object, as an API error.
-    """
+    data = line[len("data:") :].strip()
+    if data == "[DONE]":
+        return _DONE
     try:
         event: object = json.loads(data)
     except ValueError as exc:
@@ -1256,7 +1223,7 @@ def _sse_event(data: str, response: httpx.Response) -> LlamaChunk:
         raise error_from_stream_event(detail, response)
     if "error" in event:
         raise error_from_stream_event(cast("dict[str, Any]", event)["error"], response)
-    return cast("LlamaChunk", event)
+    return _convert_chunk(cast("LlamaChunk", event))
 
 
 def _convert_chunk(event: LlamaChunk) -> ChatGenerationChunk | None:
@@ -1317,34 +1284,3 @@ def _convert_chunk(event: LlamaChunk) -> ChatGenerationChunk | None:
     if logprobs := choice.get("logprobs"):
         generation_info["logprobs"] = logprobs
     return ChatGenerationChunk(message=message, generation_info=generation_info or None)
-
-
-# --- HTTP and retries -----------------------------------------------------
-
-
-def _is_retryable(error: Exception) -> bool:
-    return isinstance(error, ModelError) and error.is_retryable
-
-
-def _retry_after(response: httpx.Response) -> float | None:
-    """Seconds from a numeric `Retry-After` header, if it's present and sane."""
-    try:
-        seconds = float(response.headers.get("retry-after", ""))
-    except ValueError:
-        return None
-    return seconds if 0 <= seconds <= MAX_RETRY_AFTER else None
-
-
-def _retry_delay(attempt: int, retry_after: float | None) -> float:
-    if retry_after is not None:
-        return retry_after
-    delay = min(INITIAL_RETRY_DELAY * 2**attempt, MAX_RETRY_DELAY)
-    return delay * (1 - 0.25 * random.random())  # noqa: S311 (jitter, not crypto)
-
-
-# --- Server defaults ------------------------------------------------------
-
-
-def _round_float32(value: Any) -> Any:
-    """Undo float32 noise: 0.949999988079071 -> 0.95. Other values pass through."""
-    return float(f"{value:.7g}") if isinstance(value, float) else value
