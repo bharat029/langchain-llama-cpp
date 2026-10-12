@@ -75,15 +75,36 @@ from langchain_llama_cpp.exceptions import (
     error_from_transport,
 )
 
+# --- Constants ------------------------------------------------------------
+
 CHAT_COMPLETIONS = "/v1/chat/completions"
-
-_AsyncClients = weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient]
-
 
 # Backoff between retries, as in the openai and groq SDKs.
 INITIAL_RETRY_DELAY = 0.5
 MAX_RETRY_DELAY = 8.0
 MAX_RETRY_AFTER = 60.0
+
+# ChatLlama fields that configure the client rather than the request.
+_CLIENT_FIELDS = frozenset(
+    {
+        "model",
+        "base_url",
+        "timeout",
+        "max_retries",
+        "streaming",
+        "stream_usage",
+        "http_client",
+        "http_async_client",
+    }
+)
+
+_AsyncClients = weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient]
+
+# What `_chunk_from_line` returns for `data: [DONE]`, the end of a finished stream.
+_DONE = ChatGenerationChunk(message=AIMessageChunk(content=""))
+
+
+# --- The chat model -------------------------------------------------------
 
 
 class ChatLlama(BaseChatModel):
@@ -382,11 +403,14 @@ class ChatLlama(BaseChatModel):
     """Your own `httpx.AsyncClient` for async calls. `timeout` isn't applied to it."""
 
     _client: httpx.Client | None = PrivateAttr(default=None)
+
     # An AsyncClient's pooled connections belong to the event loop that opened
     # them, so there is one client per loop (langchain-ai/langchain#35783 is
     # this bug in ChatOpenAI). Threads running their own loops don't evict each
     # other; clients of closed loops are dropped in `_get_async_client`.
     _async_clients: _AsyncClients = PrivateAttr(default_factory=_AsyncClients)
+
+    # --- Properties -------------------------------------------------------
 
     @property
     def _llm_type(self) -> str:
@@ -401,101 +425,7 @@ class ChatLlama(BaseChatModel):
     def _identifying_params(self) -> dict[str, Any]:
         return {"model": self.model, "base_url": self.base_url, **self._params}
 
-    def _get_ls_params(
-        self, stop: list[str] | None = None, **kwargs: Any
-    ) -> LangSmithParams:
-        # Core fills the model name, temperature and max_tokens (per-call first).
-        params = super()._get_ls_params(stop=stop or self.stop, **kwargs)
-        params["ls_provider"] = MODEL_PROVIDER
-        return params
-
-    def _combine_llm_outputs(
-        self, llm_outputs: list[dict[str, Any] | None]
-    ) -> dict[str, Any]:
-        """Sum `token_usage` across calls, as ChatOpenAI does (used by `generate`)."""
-        token_usage: dict[str, Any] = {}
-        system_fingerprint = None
-        for output in llm_outputs:
-            if output is None:
-                continue
-            _add_usage(token_usage, output.get("token_usage") or {})
-            system_fingerprint = system_fingerprint or output.get("system_fingerprint")
-        combined: dict[str, Any] = {
-            "token_usage": token_usage,
-            "model_name": self.model,
-        }
-        if system_fingerprint:
-            combined["system_fingerprint"] = system_fingerprint
-        return combined
-
-    def _generate(
-        self,
-        messages: list[BaseMessage],
-        stop: list[str] | None = None,
-        run_manager: CallbackManagerForLLMRun | None = None,  # noqa: ARG002
-        **kwargs: Any,
-    ) -> ChatResult:
-        payload = self._build_payload(messages, stop, **kwargs)
-        response = self._send("POST", CHAT_COMPLETIONS, payload)
-        return _create_chat_result(response.json())
-
-    async def _agenerate(
-        self,
-        messages: list[BaseMessage],
-        stop: list[str] | None = None,
-        run_manager: AsyncCallbackManagerForLLMRun | None = None,  # noqa: ARG002
-        **kwargs: Any,
-    ) -> ChatResult:
-        payload = self._build_payload(messages, stop, **kwargs)
-        response = await self._asend("POST", CHAT_COMPLETIONS, payload)
-        return _create_chat_result(response.json())
-
-    def _stream(
-        self,
-        messages: list[BaseMessage],
-        stop: list[str] | None = None,
-        run_manager: CallbackManagerForLLMRun | None = None,  # noqa: ARG002
-        **kwargs: Any,
-    ) -> Iterator[ChatGenerationChunk]:
-        # Core calls run_manager.on_llm_new_token for each chunk itself.
-        payload = self._build_payload(messages, stop, streaming=True, **kwargs)
-        response = self._send("POST", CHAT_COMPLETIONS, payload, stream=True)
-        try:
-            for line in response.iter_lines():
-                chunk = _chunk_from_line(line, response)
-                if chunk is _DONE:
-                    return
-                if chunk is not None:
-                    yield chunk
-        except httpx.TransportError as exc:  # the connection broke mid-stream
-            raise error_from_transport(exc) from exc
-        finally:
-            response.close()  # also when the caller stops early
-        # Only [DONE] returns early: the stream was cut off.
-        raise error_from_cut_off_stream(response)
-
-    async def _astream(
-        self,
-        messages: list[BaseMessage],
-        stop: list[str] | None = None,
-        run_manager: AsyncCallbackManagerForLLMRun | None = None,  # noqa: ARG002
-        **kwargs: Any,
-    ) -> AsyncIterator[ChatGenerationChunk]:
-        payload = self._build_payload(messages, stop, streaming=True, **kwargs)
-        response = await self._asend("POST", CHAT_COMPLETIONS, payload, stream=True)
-        try:
-            async for line in response.aiter_lines():
-                chunk = _chunk_from_line(line, response)
-                if chunk is _DONE:
-                    return
-                if chunk is not None:
-                    yield chunk
-        except httpx.TransportError as exc:
-            raise error_from_transport(exc) from exc
-        finally:
-            await response.aclose()
-        # Only [DONE] returns early: the stream was cut off.
-        raise error_from_cut_off_stream(response)
+    # --- Public methods ---------------------------------------------------
 
     def get_server_defaults(self) -> dict[str, Any]:
         """Fetch the sampling defaults the server uses for this model.
@@ -712,6 +642,106 @@ class ChatLlama(BaseChatModel):
             return RunnableMap(raw=llm) | parser_with_fallback
         return llm | output_parser
 
+    # --- LangChain core hooks ---------------------------------------------
+
+    def _get_ls_params(
+        self, stop: list[str] | None = None, **kwargs: Any
+    ) -> LangSmithParams:
+        # Core fills the model name, temperature and max_tokens (per-call first).
+        params = super()._get_ls_params(stop=stop or self.stop, **kwargs)
+        params["ls_provider"] = MODEL_PROVIDER
+        return params
+
+    def _combine_llm_outputs(
+        self, llm_outputs: list[dict[str, Any] | None]
+    ) -> dict[str, Any]:
+        """Sum `token_usage` across calls, as ChatOpenAI does (used by `generate`)."""
+        token_usage: dict[str, Any] = {}
+        system_fingerprint = None
+        for output in llm_outputs:
+            if output is None:
+                continue
+            _add_usage(token_usage, output.get("token_usage") or {})
+            system_fingerprint = system_fingerprint or output.get("system_fingerprint")
+        combined: dict[str, Any] = {
+            "token_usage": token_usage,
+            "model_name": self.model,
+        }
+        if system_fingerprint:
+            combined["system_fingerprint"] = system_fingerprint
+        return combined
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,  # noqa: ARG002
+        **kwargs: Any,
+    ) -> ChatResult:
+        payload = self._build_payload(messages, stop, **kwargs)
+        response = self._send("POST", CHAT_COMPLETIONS, payload)
+        return _create_chat_result(response.json())
+
+    async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,  # noqa: ARG002
+        **kwargs: Any,
+    ) -> ChatResult:
+        payload = self._build_payload(messages, stop, **kwargs)
+        response = await self._asend("POST", CHAT_COMPLETIONS, payload)
+        return _create_chat_result(response.json())
+
+    def _stream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,  # noqa: ARG002
+        **kwargs: Any,
+    ) -> Iterator[ChatGenerationChunk]:
+        # Core calls run_manager.on_llm_new_token for each chunk itself.
+        payload = self._build_payload(messages, stop, streaming=True, **kwargs)
+        response = self._send("POST", CHAT_COMPLETIONS, payload, stream=True)
+        try:
+            for line in response.iter_lines():
+                chunk = _chunk_from_line(line, response)
+                if chunk is _DONE:
+                    return
+                if chunk is not None:
+                    yield chunk
+        except httpx.TransportError as exc:  # the connection broke mid-stream
+            raise error_from_transport(exc) from exc
+        finally:
+            response.close()  # also when the caller stops early
+        # Only [DONE] returns early: the stream was cut off.
+        raise error_from_cut_off_stream(response)
+
+    async def _astream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,  # noqa: ARG002
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        payload = self._build_payload(messages, stop, streaming=True, **kwargs)
+        response = await self._asend("POST", CHAT_COMPLETIONS, payload, stream=True)
+        try:
+            async for line in response.aiter_lines():
+                chunk = _chunk_from_line(line, response)
+                if chunk is _DONE:
+                    return
+                if chunk is not None:
+                    yield chunk
+        except httpx.TransportError as exc:
+            raise error_from_transport(exc) from exc
+        finally:
+            await response.aclose()
+        # Only [DONE] returns early: the stream was cut off.
+        raise error_from_cut_off_stream(response)
+
+    # --- Request building -------------------------------------------------
+
     def _build_payload(
         self,
         messages: list[BaseMessage],
@@ -747,6 +777,8 @@ class ChatLlama(BaseChatModel):
     ) -> httpx.Request:
         url = self.base_url.rstrip("/") + path
         return httpx.Request(method, url, json=payload)
+
+    # --- HTTP -------------------------------------------------------------
 
     def _get_client(self) -> httpx.Client:
         if self.http_client is not None:
@@ -852,66 +884,7 @@ class ChatLlama(BaseChatModel):
         return _retry_delay(attempt, retry_after)
 
 
-# ChatLlama fields that configure the client rather than the request.
-_CLIENT_FIELDS = frozenset(
-    {
-        "model",
-        "base_url",
-        "timeout",
-        "max_retries",
-        "streaming",
-        "stream_usage",
-        "http_client",
-        "http_async_client",
-    }
-)
-
-
-def _is_retryable(error: Exception) -> bool:
-    return isinstance(error, ModelError) and error.is_retryable
-
-
-def _sse_data(line: str) -> str | None:
-    """The payload of an SSE `data:` line; None for anything else.
-
-    Anything else is a blank separator, a `:` keep-alive ping, or another field.
-    """
-    if not line.startswith("data:"):
-        return None
-    return line[len("data:") :].strip()
-
-
-# What `_chunk_from_line` returns for `data: [DONE]`, the end of a finished stream.
-_DONE = ChatGenerationChunk(message=AIMessageChunk(content=""))
-
-
-def _chunk_from_line(line: str, response: httpx.Response) -> ChatGenerationChunk | None:
-    """The chunk for one SSE line: None to skip the line, `_DONE` at the end."""
-    data = _sse_data(line)
-    if data is None:
-        return None
-    if data == "[DONE]":
-        return _DONE
-    return _convert_chunk(_sse_event(data, response))
-
-
-def _sse_event(data: str, response: httpx.Response) -> dict[str, Any]:
-    """Decode one event. An `error` event (failure mid-stream) is raised.
-
-    So is data that isn't a JSON object, as an API error.
-    """
-    try:
-        event: object = json.loads(data)
-    except ValueError as exc:
-        detail = {"message": f"invalid JSON in stream event: {data[:200]!r}"}
-        raise error_from_stream_event(detail, response) from exc
-    if not isinstance(event, dict):
-        detail = {"message": f"stream event isn't a JSON object: {data[:200]!r}"}
-        raise error_from_stream_event(detail, response)
-    event = cast("dict[str, Any]", event)
-    if "error" in event:
-        raise error_from_stream_event(event["error"], response)
-    return event
+# --- Public functions -----------------------------------------------------
 
 
 def request_field_names() -> list[str]:
@@ -929,6 +902,40 @@ def request_field_names() -> list[str]:
 
 
 _REQUEST_FIELDS = tuple(request_field_names())  # fixed once the class exists
+
+
+# --- Requests -------------------------------------------------------------
+
+
+def _convert_message(message: BaseMessage) -> dict[str, Any]:
+    """Convert a message to the OpenAI shape llama-server expects."""
+    converted = convert_to_openai_messages(message)
+    if isinstance(message, AIMessage):
+        # Core leaves v1 reasoning blocks in `content`; send text as content and
+        # reasoning as `reasoning_content` (M1-c: the chat template decides).
+        converted["content"] = message.text
+        if isinstance(message.content, str):
+            # No blocks to look through; this is where core's best-effort
+            # parsing finds reasoning for string content.
+            kwarg = message.additional_kwargs.get("reasoning_content")
+            reasoning = kwarg if isinstance(kwarg, str) else ""
+        else:
+            reasoning = "".join(
+                block.get("reasoning", "")
+                for block in message.content_blocks
+                if block["type"] == "reasoning"
+            )
+        if reasoning:
+            converted["reasoning_content"] = reasoning
+    return converted
+
+
+def _without_none(**items: Any) -> dict[str, Any]:
+    """`items` minus the ones that are None."""
+    return {key: value for key, value in items.items() if value is not None}
+
+
+# --- Tools and structured output ------------------------------------------
 
 
 def _tool_choice(
@@ -1093,27 +1100,7 @@ def _add_to_system_message(
     return [SystemMessage(content=instructions), *messages]
 
 
-def _convert_message(message: BaseMessage) -> dict[str, Any]:
-    """Convert a message to the OpenAI shape llama-server expects."""
-    converted = convert_to_openai_messages(message)
-    if isinstance(message, AIMessage):
-        # Core leaves v1 reasoning blocks in `content`; send text as content and
-        # reasoning as `reasoning_content` (M1-c: the chat template decides).
-        converted["content"] = message.text
-        if isinstance(message.content, str):
-            # No blocks to look through; this is where core's best-effort
-            # parsing finds reasoning for string content.
-            kwarg = message.additional_kwargs.get("reasoning_content")
-            reasoning = kwarg if isinstance(kwarg, str) else ""
-        else:
-            reasoning = "".join(
-                block.get("reasoning", "")
-                for block in message.content_blocks
-                if block["type"] == "reasoning"
-            )
-        if reasoning:
-            converted["reasoning_content"] = reasoning
-    return converted
+# --- Replies --------------------------------------------------------------
 
 
 def _create_chat_result(data: Mapping[str, Any]) -> ChatResult:
@@ -1180,6 +1167,85 @@ def _convert_response_message(message: Mapping[str, Any]) -> AIMessage:
     )
 
 
+def _create_usage_metadata(usage: Mapping[str, Any]) -> UsageMetadata:
+    """Map llama-server's `usage` the way ChatOpenAI does."""
+    input_tokens: int = usage.get("prompt_tokens") or 0
+    output_tokens: int = usage.get("completion_tokens") or 0
+    total_tokens: int | None = usage.get("total_tokens")
+    prompt_details: Mapping[str, Any] = usage.get("prompt_tokens_details") or {}
+    completion_details: Mapping[str, Any] = usage.get("completion_tokens_details") or {}
+    cache_read: int | None = prompt_details.get("cached_tokens")
+    reasoning: int | None = completion_details.get("reasoning_tokens")
+    input_details = InputTokenDetails()
+    if cache_read is not None:
+        input_details["cache_read"] = cache_read
+    output_details = OutputTokenDetails()
+    if reasoning is not None:
+        output_details["reasoning"] = reasoning
+    return UsageMetadata(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=(
+            total_tokens if total_tokens is not None else input_tokens + output_tokens
+        ),
+        input_token_details=input_details,
+        output_token_details=output_details,
+    )
+
+
+def _add_usage(total: dict[str, Any], usage: Mapping[str, Any]) -> None:
+    """Add `usage` into `total`, recursing into nested detail dicts."""
+    for key, value in usage.items():
+        if value is None:
+            continue
+        if isinstance(value, Mapping):
+            _add_usage(total.setdefault(key, {}), value)  # pyright: ignore[reportUnknownArgumentType]
+        elif isinstance(value, int | float):
+            total[key] = total.get(key, 0) + value
+
+
+# --- Streams --------------------------------------------------------------
+
+
+def _chunk_from_line(line: str, response: httpx.Response) -> ChatGenerationChunk | None:
+    """The chunk for one SSE line: None to skip the line, `_DONE` at the end."""
+    data = _sse_data(line)
+    if data is None:
+        return None
+    if data == "[DONE]":
+        return _DONE
+    return _convert_chunk(_sse_event(data, response))
+
+
+def _sse_data(line: str) -> str | None:
+    """The payload of an SSE `data:` line; None for anything else.
+
+    Anything else is a blank separator, a `:` keep-alive ping, or another field.
+    """
+    if not line.startswith("data:"):
+        return None
+    return line[len("data:") :].strip()
+
+
+def _sse_event(data: str, response: httpx.Response) -> dict[str, Any]:
+    """Decode one event. An `error` event (failure mid-stream) is raised.
+
+    So is data that isn't a JSON object, as an API error.
+    """
+    try:
+        event: object = json.loads(data)
+    except ValueError as exc:
+        detail = {"message": f"invalid JSON in stream event: {data[:200]!r}"}
+        raise error_from_stream_event(detail, response) from exc
+    if not isinstance(event, dict):
+        detail = {"message": f"stream event isn't a JSON object: {data[:200]!r}"}
+        raise error_from_stream_event(detail, response)
+    event = cast("dict[str, Any]", event)
+    if "error" in event:
+        raise error_from_stream_event(event["error"], response)
+    return event
+
+
 def _convert_chunk(event: Mapping[str, Any]) -> ChatGenerationChunk | None:
     """Convert one streamed `chat.completion.chunk` to a LangChain chunk.
 
@@ -1241,51 +1307,11 @@ def _convert_chunk(event: Mapping[str, Any]) -> ChatGenerationChunk | None:
     return ChatGenerationChunk(message=message, generation_info=generation_info or None)
 
 
-def _create_usage_metadata(usage: Mapping[str, Any]) -> UsageMetadata:
-    """Map llama-server's `usage` the way ChatOpenAI does."""
-    input_tokens: int = usage.get("prompt_tokens") or 0
-    output_tokens: int = usage.get("completion_tokens") or 0
-    total_tokens: int | None = usage.get("total_tokens")
-    prompt_details: Mapping[str, Any] = usage.get("prompt_tokens_details") or {}
-    completion_details: Mapping[str, Any] = usage.get("completion_tokens_details") or {}
-    cache_read: int | None = prompt_details.get("cached_tokens")
-    reasoning: int | None = completion_details.get("reasoning_tokens")
-    input_details = InputTokenDetails()
-    if cache_read is not None:
-        input_details["cache_read"] = cache_read
-    output_details = OutputTokenDetails()
-    if reasoning is not None:
-        output_details["reasoning"] = reasoning
-    return UsageMetadata(
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        total_tokens=(
-            total_tokens if total_tokens is not None else input_tokens + output_tokens
-        ),
-        input_token_details=input_details,
-        output_token_details=output_details,
-    )
+# --- HTTP and retries -----------------------------------------------------
 
 
-def _add_usage(total: dict[str, Any], usage: Mapping[str, Any]) -> None:
-    """Add `usage` into `total`, recursing into nested detail dicts."""
-    for key, value in usage.items():
-        if value is None:
-            continue
-        if isinstance(value, Mapping):
-            _add_usage(total.setdefault(key, {}), value)  # pyright: ignore[reportUnknownArgumentType]
-        elif isinstance(value, int | float):
-            total[key] = total.get(key, 0) + value
-
-
-def _without_none(**items: Any) -> dict[str, Any]:
-    """`items` minus the ones that are None."""
-    return {key: value for key, value in items.items() if value is not None}
-
-
-def _round_float32(value: Any) -> Any:
-    """Undo float32 noise: 0.949999988079071 -> 0.95. Other values pass through."""
-    return float(f"{value:.7g}") if isinstance(value, float) else value
+def _is_retryable(error: Exception) -> bool:
+    return isinstance(error, ModelError) and error.is_retryable
 
 
 def _retry_after(response: httpx.Response) -> float | None:
@@ -1302,3 +1328,11 @@ def _retry_delay(attempt: int, retry_after: float | None) -> float:
         return retry_after
     delay = min(INITIAL_RETRY_DELAY * 2**attempt, MAX_RETRY_DELAY)
     return delay * (1 - 0.25 * random.random())  # noqa: S311 (jitter, not crypto)
+
+
+# --- Server defaults ------------------------------------------------------
+
+
+def _round_float32(value: Any) -> Any:
+    """Undo float32 noise: 0.949999988079071 -> 0.95. Other values pass through."""
+    return float(f"{value:.7g}") if isinstance(value, float) else value

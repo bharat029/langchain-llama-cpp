@@ -132,6 +132,20 @@ def error_from_cut_off_stream(response: httpx.Response) -> LlamaConnectionError:
     )
 
 
+def error_from_transport(exc: httpx.TransportError) -> httpx.TransportError:
+    """Wrap an httpx transport failure in the matching ChatLlama error."""
+    try:
+        request: httpx.Request | None = exc.request
+    except RuntimeError:  # httpx raises this when no request is attached
+        request = None
+    cls = (
+        LlamaTimeoutError
+        if isinstance(exc, httpx.TimeoutException)
+        else LlamaConnectionError
+    )
+    return cls(str(exc) or type(exc).__name__, request=request)
+
+
 def _build_error(
     message: str,
     detail: dict[str, Any],
@@ -170,17 +184,3 @@ def _build_error(
 def _json_object(value: object) -> dict[str, Any]:
     """`value` if it's a JSON object, else an empty dict."""
     return cast("dict[str, Any]", value) if isinstance(value, dict) else {}
-
-
-def error_from_transport(exc: httpx.TransportError) -> httpx.TransportError:
-    """Wrap an httpx transport failure in the matching ChatLlama error."""
-    try:
-        request: httpx.Request | None = exc.request
-    except RuntimeError:  # httpx raises this when no request is attached
-        request = None
-    cls = (
-        LlamaTimeoutError
-        if isinstance(exc, httpx.TimeoutException)
-        else LlamaConnectionError
-    )
-    return cls(str(exc) or type(exc).__name__, request=request)
