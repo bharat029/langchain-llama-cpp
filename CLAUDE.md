@@ -14,7 +14,7 @@ A LangChain chat model (`ChatLlama`) for llama.cpp's `llama-server`, used direct
   - Aliases, not separate fields: `n_predict`/`max_completion_tokens` → `max_tokens`, `n_cmpl` → `n`, `thinking_budget_tokens` → `reasoning_budget_tokens`.
   - `verbose` clashes with core's own `verbose` field (callback verbosity), so it isn't typed; pass it per call with `invoke(..., verbose=True)` if you need it.
   - Speculative-decoding fields are compiled out (`#if 0`) in b11429.
-- **Python** 3.10+. Dependencies: `langchain-core>=1.0,<2`, `httpx>=0.27,<1`.
+- **Python** 3.10+. Dependencies: `langchain-core>=1.6,<2` (1.6 added the `ModelError` exceptions we subclass), `httpx>=0.27,<1`.
 - **Milestones**, each ending with passing tests and a review:
   1. `invoke`: message conversion, reasoning, usage, `response_metadata`, clear errors for 400 overflow and 404.
   2. `stream` and real async (`_stream`, `_agenerate`, `_astream`), including streamed tool-call chunks (moved here from milestone 4 so streaming never drops tool calls).
