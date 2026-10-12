@@ -152,13 +152,16 @@ def _build_error(
             n_prompt_tokens=detail.get("n_prompt_tokens"),
             n_ctx=detail.get("n_ctx"),
         )
-    cls = fallback
-    if status in _STATUS_ERRORS:
+    if status is None:
+        cls = fallback
+    elif status in _STATUS_ERRORS:
         cls = _STATUS_ERRORS[status]
-    elif status is not None and 400 <= status < 500:  # noqa: PLR2004
+    elif 400 <= status < 500:  # noqa: PLR2004
         cls = LlamaInvalidRequestError
-    elif status is not None and status >= 500:  # noqa: PLR2004
+    elif status >= 500:  # noqa: PLR2004
         cls = LlamaAPIError
+    else:
+        cls = fallback
     return cls(message, request=request, response=response)
 
 

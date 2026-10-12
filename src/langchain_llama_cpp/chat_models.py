@@ -356,8 +356,7 @@ class ChatLlama(BaseChatModel):
     @property
     def _params(self) -> dict[str, Any]:
         """Request fields set on the model; fields left at `None` are left out."""
-        params = {name: getattr(self, name) for name in _REQUEST_FIELDS}
-        return {key: value for key, value in params.items() if value is not None}
+        return _without_none(**{name: getattr(self, name) for name in _REQUEST_FIELDS})
 
     @property
     def _identifying_params(self) -> dict[str, Any]:
@@ -366,15 +365,9 @@ class ChatLlama(BaseChatModel):
     def _get_ls_params(
         self, stop: list[str] | None = None, **kwargs: Any
     ) -> LangSmithParams:
-        params = super()._get_ls_params(stop=stop, **kwargs)
+        # Core fills the model name, temperature and max_tokens (per-call first).
+        params = super()._get_ls_params(stop=stop or self.stop, **kwargs)
         params["ls_provider"] = MODEL_PROVIDER
-        params["ls_model_name"] = kwargs.get("model", self.model)  # per-call override
-        if self.temperature is not None:
-            params["ls_temperature"] = self.temperature
-        if self.max_tokens is not None:
-            params["ls_max_tokens"] = self.max_tokens
-        if ls_stop := stop or self.stop:
-            params["ls_stop"] = ls_stop
         return params
 
     def _combine_llm_outputs(
@@ -404,7 +397,7 @@ class ChatLlama(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         payload = self._build_payload(messages, stop, **kwargs)
-        response = self._request("POST", CHAT_COMPLETIONS, payload)
+        response = self._send("POST", CHAT_COMPLETIONS, payload)
         return _create_chat_result(response.json())
 
     async def _agenerate(
@@ -415,7 +408,7 @@ class ChatLlama(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         payload = self._build_payload(messages, stop, **kwargs)
-        response = await self._arequest("POST", CHAT_COMPLETIONS, payload)
+        response = await self._asend("POST", CHAT_COMPLETIONS, payload)
         return _create_chat_result(response.json())
 
     def _stream(
@@ -427,16 +420,13 @@ class ChatLlama(BaseChatModel):
     ) -> Iterator[ChatGenerationChunk]:
         # Core calls run_manager.on_llm_new_token for each chunk itself.
         payload = self._build_payload(messages, stop, streaming=True, **kwargs)
-        request = self._build_request("POST", CHAT_COMPLETIONS, payload)
-        response = self._send(self._get_client(), request, stream=True)
+        response = self._send("POST", CHAT_COMPLETIONS, payload, stream=True)
         try:
             for line in response.iter_lines():
-                data = _sse_data(line)
-                if data is None:
-                    continue
-                if data == "[DONE]":
+                chunk = _chunk_from_line(line, response)
+                if chunk is _DONE:
                     return
-                if chunk := _convert_chunk(_sse_event(data, response)):
+                if chunk is not None:
                     yield chunk
         except httpx.TransportError as exc:  # the connection broke mid-stream
             raise error_from_transport(exc) from exc
@@ -453,17 +443,13 @@ class ChatLlama(BaseChatModel):
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
         payload = self._build_payload(messages, stop, streaming=True, **kwargs)
-        request = self._build_request("POST", CHAT_COMPLETIONS, payload)
-        client = self._get_async_client()
-        response = await self._asend(client, request, stream=True)
+        response = await self._asend("POST", CHAT_COMPLETIONS, payload, stream=True)
         try:
             async for line in response.aiter_lines():
-                data = _sse_data(line)
-                if data is None:
-                    continue
-                if data == "[DONE]":
+                chunk = _chunk_from_line(line, response)
+                if chunk is _DONE:
                     return
-                if chunk := _convert_chunk(_sse_event(data, response)):
+                if chunk is not None:
                     yield chunk
         except httpx.TransportError as exc:
             raise error_from_transport(exc) from exc
@@ -490,7 +476,7 @@ class ChatLlama(BaseChatModel):
             # {"temperature": 1.0, "top_k": 64, "top_p": 0.95, "max_tokens": -1, ...}
             ```
         """
-        response = self._request("GET", f"/upstream/{self.model}/props")
+        response = self._send("GET", f"/upstream/{self.model}/props")
         settings: dict[str, Any] = response.json()["default_generation_settings"]
         defaults = {
             key: _round_float32(value)
@@ -718,7 +704,7 @@ class ChatLlama(BaseChatModel):
         return payload
 
     def _build_request(
-        self, method: str, path: str, payload: dict[str, Any] | None = None
+        self, method: str, path: str, payload: dict[str, Any] | None
     ) -> httpx.Request:
         url = self.base_url.rstrip("/") + path
         return httpx.Request(method, url, json=payload)
@@ -741,33 +727,28 @@ class ChatLlama(BaseChatModel):
             self._async_clients[loop] = client
         return client
 
-    def _request(
-        self, method: str, path: str, payload: dict[str, Any] | None = None
-    ) -> httpx.Response:
-        request = self._build_request(method, path, payload)
-        return self._send(self._get_client(), request, stream=False)
-
-    async def _arequest(
-        self, method: str, path: str, payload: dict[str, Any] | None = None
-    ) -> httpx.Response:
-        request = self._build_request(method, path, payload)
-        return await self._asend(self._get_async_client(), request, stream=False)
-
     def _send(
-        self, client: httpx.Client, request: httpx.Request, *, stream: bool
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        stream: bool = False,
     ) -> httpx.Response:
-        """Send, retrying on errors core marks `is_retryable`.
+        """Send a request to `path`, retrying on errors core marks `is_retryable`.
 
         With `stream=True` this returns once the headers arrive, so retries only
         cover the request itself; a failure mid-stream is raised, not retried.
         """
+        client = self._get_client()
+        request = self._build_request(method, path, payload)
         attempt = 0
         while True:
             try:
                 response = client.send(request, stream=stream)
             except httpx.TransportError as exc:
                 delay = self._retry_delay_or_raise(
-                    attempt, error_from_transport(exc), exc, None
+                    attempt, error_from_transport(exc), cause=exc
                 )
             else:
                 if response.is_success:
@@ -775,22 +756,29 @@ class ChatLlama(BaseChatModel):
                 response.read()  # a streamed error body isn't read yet
                 response.close()
                 delay = self._retry_delay_or_raise(
-                    attempt, error_from_response(response), None, response
+                    attempt, error_from_response(response)
                 )
             time.sleep(delay)
             attempt += 1
 
     async def _asend(
-        self, client: httpx.AsyncClient, request: httpx.Request, *, stream: bool
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        stream: bool = False,
     ) -> httpx.Response:
         """Async twin of `_send`."""
+        client = self._get_async_client()
+        request = self._build_request(method, path, payload)
         attempt = 0
         while True:
             try:
                 response = await client.send(request, stream=stream)
             except httpx.TransportError as exc:
                 delay = self._retry_delay_or_raise(
-                    attempt, error_from_transport(exc), exc, None
+                    attempt, error_from_transport(exc), cause=exc
                 )
             else:
                 if response.is_success:
@@ -798,25 +786,25 @@ class ChatLlama(BaseChatModel):
                 await response.aread()
                 await response.aclose()
                 delay = self._retry_delay_or_raise(
-                    attempt, error_from_response(response), None, response
+                    attempt, error_from_response(response)
                 )
             await asyncio.sleep(delay)
             attempt += 1
 
     def _retry_delay_or_raise(
-        self,
-        attempt: int,
-        error: Exception,
-        cause: BaseException | None,
-        response: httpx.Response | None,
+        self, attempt: int, error: Exception, cause: BaseException | None = None
     ) -> float:
         """Seconds to wait before retrying `error`, or raise it if it's final.
 
-        `response` is the error response, for its `Retry-After` header.
+        An HTTP error's response supplies `Retry-After`.
         """
         if not _is_retryable(error) or attempt >= self.max_retries:
             raise error from cause
-        retry_after = _retry_after(response) if response is not None else None
+        retry_after = (
+            _retry_after(error.response)
+            if isinstance(error, httpx.HTTPStatusError)
+            else None
+        )
         return _retry_delay(attempt, retry_after)
 
 
@@ -847,6 +835,20 @@ def _sse_data(line: str) -> str | None:
     if not line.startswith("data:"):
         return None
     return line[len("data:") :].strip()
+
+
+# What `_chunk_from_line` returns for `data: [DONE]`, the end of a finished stream.
+_DONE = ChatGenerationChunk(message=AIMessageChunk(content=""))
+
+
+def _chunk_from_line(line: str, response: httpx.Response) -> ChatGenerationChunk | None:
+    """The chunk for one SSE line: None to skip the line, `_DONE` at the end."""
+    data = _sse_data(line)
+    if data is None:
+        return None
+    if data == "[DONE]":
+        return _DONE
+    return _convert_chunk(_sse_event(data, response))
 
 
 def _sse_event(data: str, response: httpx.Response) -> dict[str, Any]:
@@ -1072,17 +1074,13 @@ def _convert_message(message: BaseMessage) -> dict[str, Any]:
 
 def _create_chat_result(data: Mapping[str, Any]) -> ChatResult:
     usage = data.get("usage")
-    response_metadata = {
-        key: value
-        for key, value in {
-            "model_name": data.get("model"),
-            "system_fingerprint": data.get("system_fingerprint"),
-            "id": data.get("id"),
-            "timings": data.get("timings"),
-            "model_provider": MODEL_PROVIDER,
-        }.items()
-        if value is not None
-    }
+    response_metadata = _without_none(
+        model_name=data.get("model"),
+        system_fingerprint=data.get("system_fingerprint"),
+        id=data.get("id"),
+        timings=data.get("timings"),
+        model_provider=MODEL_PROVIDER,
+    )
     generations: list[ChatGeneration] = []
     choices: list[dict[str, Any]] = data.get("choices") or []
     for choice in choices:
@@ -1186,21 +1184,17 @@ def _convert_chunk(event: Mapping[str, Any]) -> ChatGenerationChunk | None:
         tool_call_chunks=tool_call_chunks,
         response_metadata={"model_provider": MODEL_PROVIDER},
     )
-    generation_info: dict[str, Any] | None = None
+    generation_info: dict[str, Any] = {}
     if finish_reason := choice.get("finish_reason"):
-        generation_info = {
-            key: value
-            for key, value in {
-                "finish_reason": finish_reason,
-                "model_name": event.get("model"),
-                "system_fingerprint": event.get("system_fingerprint"),
-                "id": event.get("id"),
-            }.items()
-            if value is not None
-        }
-    if choice.get("logprobs"):
-        generation_info = {**(generation_info or {}), "logprobs": choice["logprobs"]}
-    return ChatGenerationChunk(message=message, generation_info=generation_info)
+        generation_info = _without_none(
+            finish_reason=finish_reason,
+            model_name=event.get("model"),
+            system_fingerprint=event.get("system_fingerprint"),
+            id=event.get("id"),
+        )
+    if logprobs := choice.get("logprobs"):
+        generation_info["logprobs"] = logprobs
+    return ChatGenerationChunk(message=message, generation_info=generation_info or None)
 
 
 def _create_usage_metadata(usage: Mapping[str, Any]) -> UsageMetadata:
@@ -1238,6 +1232,11 @@ def _add_usage(total: dict[str, Any], usage: Mapping[str, Any]) -> None:
             _add_usage(total.setdefault(key, {}), value)  # pyright: ignore[reportUnknownArgumentType]
         elif isinstance(value, int | float):
             total[key] = total.get(key, 0) + value
+
+
+def _without_none(**items: Any) -> dict[str, Any]:
+    """`items` minus the ones that are None."""
+    return {key: value for key, value in items.items() if value is not None}
 
 
 def _round_float32(value: Any) -> Any:

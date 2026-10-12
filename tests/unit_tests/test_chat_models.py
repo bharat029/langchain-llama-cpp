@@ -416,6 +416,17 @@ def test_ls_params() -> None:
     assert params.get("ls_max_tokens") == 9
 
 
+def test_ls_params_prefer_per_call_values() -> None:
+    llm = ChatLlama(
+        model="gemma", base_url=BASE_URL, temperature=0.2, max_tokens=9, stop=["x"]
+    )
+    params = llm._get_ls_params(temperature=0.7, max_tokens=50)
+    assert params.get("ls_temperature") == 0.7
+    assert params.get("ls_max_tokens") == 50
+    assert params.get("ls_stop") == ["x"]
+    assert llm._get_ls_params(stop=["y"]).get("ls_stop") == ["y"]
+
+
 # --- server defaults -------------------------------------------------------
 
 # Trimmed from GET /upstream/gemma/props, llama-server b11429, 2026-10-11.
