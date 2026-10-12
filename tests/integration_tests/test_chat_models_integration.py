@@ -19,10 +19,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 # Thinking tokens count towards max_tokens, so the cap is higher with thinking on.
+# 1000 was too low: qwen used 656-1000+ tokens for test_json_mode and gemma
+# 276-1000+ for test_structured_output_optional_param (5 repeats each, 2026-10-11/12).
 NO_THINKING_MAX_TOKENS = 300
-THINKING_MAX_TOKENS = 1000
-# qwen reasons longer: 656-1000+ tokens for test_json_mode (5 repeats, 2026-10-11).
-QWEN_THINKING_MAX_TOKENS = 2000
+THINKING_MAX_TOKENS = 2000
 
 
 class ChatLlamaIntegrationTests(ChatModelIntegrationTests):
@@ -82,7 +82,7 @@ class TestQwenThinking(ChatLlamaIntegrationTests):
     model_name = "qwen"
     extra_params = {
         "chat_template_kwargs": {"enable_thinking": True},
-        "max_tokens": QWEN_THINKING_MAX_TOKENS,
+        "max_tokens": THINKING_MAX_TOKENS,
     }
 
 
