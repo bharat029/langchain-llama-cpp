@@ -197,6 +197,9 @@ seconds and defaults to `None` (no timeout), since local generation can be slow.
 
 ## Development
 
+Bug reports and pull requests are welcome on
+[GitHub](https://github.com/bharat029/langchain-llama-cpp/issues).
+
 ```bash
 uv sync
 uv run pytest tests/unit_tests          # offline

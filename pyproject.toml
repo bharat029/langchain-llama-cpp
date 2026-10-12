@@ -24,6 +24,10 @@ dependencies = [
     "langchain-core>=1.6,<2",
 ]
 
+[project.urls]
+Repository = "https://github.com/bharat029/langchain-llama-cpp"
+Issues = "https://github.com/bharat029/langchain-llama-cpp/issues"
+
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
 build-backend = "uv_build"
