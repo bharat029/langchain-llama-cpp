@@ -15,3 +15,6 @@ CLAUDE.local.md
 
 # Editor settings
 .vscode/
+
+# Local experiments
+notebooks/

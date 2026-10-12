@@ -87,7 +87,6 @@ ban-relative-imports = "all"
     "ARG001",  # Unused fixture arguments
     "PT011",   # Broad pytest.raises
 ]
-"notebooks/**" = ["T201", "D", "INP001", "ANN"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"  # the langchain-tests async tests aren't marked
