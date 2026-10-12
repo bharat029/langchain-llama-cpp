@@ -89,6 +89,44 @@ MAX_RETRY_AFTER = 60.0
 class ChatLlama(BaseChatModel):
     """Chat model for llama.cpp's `llama-server`, reached through llama-swap.
 
+    Key init args — completion params:
+        model: str
+            llama-swap entry to use, e.g. `"gemma"`. Required.
+        max_tokens: int | None
+            Maximum tokens to generate. Thinking tokens count too.
+        temperature: float | None
+            Randomness (0 = greedy).
+        top_k, top_p, min_p: int | float | None
+            Sampling cut-offs.
+        stop: list[str] | None
+            Stop strings.
+        chat_template_kwargs: dict | None
+            Variables for the chat template; the thinking switch lives here and
+            differs per family: `{"enable_thinking": False}` (gemma, qwen),
+            `{"reasoning_effort": "low"}` (gpt-oss).
+        seed: int | None
+            Random seed.
+
+    Key init args — client params:
+        base_url: str
+            Server root, e.g. `http://localhost:8080`. Defaults to the
+            `LLAMA_BASE_URL` environment variable.
+        timeout: float | httpx.Timeout | None
+            Request timeout in seconds. `None` (the default) means none.
+        max_retries: int
+            Retries for connection errors, timeouts, 429 and 5xx (default 2).
+        streaming: bool
+            Route `invoke` through streaming.
+        stream_usage: bool
+            Ask for the final usage chunk when streaming (default on).
+        http_client, http_async_client: httpx.Client | httpx.AsyncClient | None
+            Your own httpx clients.
+
+    Every request field `/v1/chat/completions` accepts has its own typed field,
+    documented on the field itself. All default to `None`, which leaves the
+    field out of the request so the server's per-model default applies (see
+    `get_server_defaults`).
+
     Example:
         ```python
         from langchain_llama_cpp import ChatLlama
