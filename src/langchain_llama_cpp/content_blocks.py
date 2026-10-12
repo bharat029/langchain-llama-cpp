@@ -50,16 +50,19 @@ def translate_content_chunk(message: AIMessageChunk) -> list[types.ContentBlock]
     blocks: list[dict[str, Any]] = [dict(block) for block in translate_content(message)]
     if message.tool_call_chunks and message.chunk_position != "last":
         blocks = [block for block in blocks if block["type"] not in _TOOL_CALL_TYPES]
-        for chunk in message.tool_call_chunks:
-            block: dict[str, Any] = {
-                "type": "tool_call_chunk",
-                "id": chunk.get("id"),
-                "name": chunk.get("name"),
-                "args": chunk.get("args"),
-            }
-            if (index := chunk.get("index")) is not None:
-                block["index"] = f"lc_tc_{index}"
-            blocks.append(block)
+        for position, chunk in enumerate(message.tool_call_chunks):
+            # Without the server's index, the chunk's position stands in, so the
+            # block never falls back to core's colliding counter.
+            index = chunk.get("index")
+            blocks.append(
+                {
+                    "type": "tool_call_chunk",
+                    "id": chunk.get("id"),
+                    "name": chunk.get("name"),
+                    "args": chunk.get("args"),
+                    "index": f"lc_tc_{position if index is None else index}",
+                }
+            )
     return blocks  # pyright: ignore[reportReturnType]
 
 

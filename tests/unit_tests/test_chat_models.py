@@ -1408,3 +1408,110 @@ def test_structured_output_rejects_extra_tools() -> None:
 def test_negative_max_retries_is_rejected() -> None:
     with pytest.raises(ValidationError):
         ChatLlama(model="gemma", base_url=BASE_URL, max_retries=-1)
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [INNER_SCHEMA, {"type": "json_schema", "json_schema": INNER_SCHEMA}],
+    ids=["name-schema", "response-format"],
+)
+def test_function_calling_accepts_openai_response_format_shapes(schema: Any) -> None:
+    server = Server(tool_call_reply('{"age": 24}'))
+    structured = make_llm(server).with_structured_output(schema)
+    assert structured.invoke("Alice is 2.") == {"age": 24}
+    assert server.bodies[0]["tools"] == [
+        {
+            "type": "function",
+            "function": {"name": "Age", "parameters": AGE_PARAMETERS, "strict": True},
+        }
+    ]
+
+
+@pytest.mark.parametrize("method", ["function_calling", "json_schema"])
+def test_response_format_without_a_schema_is_rejected(method: Any) -> None:
+    schema = {"type": "json_schema", "json_schema": {"name": "Age"}}
+    with pytest.raises(ValueError, match="needs"):
+        make_llm(Server()).with_structured_output(schema, method=method)
+
+
+def test_each_event_loop_keeps_its_own_async_client() -> None:
+    llm = ChatLlama(model="gemma", base_url=BASE_URL)
+
+    async def client() -> httpx.AsyncClient:
+        return llm._get_async_client()
+
+    first_loop, second_loop = asyncio.new_event_loop(), asyncio.new_event_loop()
+    try:
+        first = first_loop.run_until_complete(client())
+        second = second_loop.run_until_complete(client())
+        assert second is not first
+        # Alternating loops (threads with their own loops) don't evict each other.
+        assert first_loop.run_until_complete(client()) is first
+    finally:
+        first_loop.close()
+        second_loop.close()
+
+
+def test_streaming_with_n_cmpl_above_1_is_refused() -> None:
+    per_call: dict[str, Any] = {"n_cmpl": 2}
+    with pytest.raises(ValueError, match="n must be 1 when streaming"):
+        list(make_llm(Server()).stream("hi", **per_call))
+
+
+def test_stream_without_done_is_an_error() -> None:
+    server = Server(sse(*EVENTS[:5], tail=""))
+    received: list[str] = []
+    with pytest.raises(LlamaConnectionError, match=r"without data: \[DONE\]") as info:
+        received.extend(chunk.text for chunk in make_llm(server).stream("hi"))
+    assert "".join(received) == "391"  # chunks before the cut were delivered
+    assert info.value.__cause__ is None  # raised once, not re-wrapped
+
+
+def test_astream_without_done_is_an_error() -> None:
+    llm = make_llm(Server(sse(*EVENTS[:3], tail="")))
+
+    async def collect() -> list[AIMessageChunk]:
+        return [chunk async for chunk in llm.astream("hi")]
+
+    with pytest.raises(LlamaConnectionError):
+        asyncio.run(collect())
+
+
+@pytest.mark.parametrize("data", ["{not json", "[1, 2]"])
+def test_malformed_stream_event_is_an_api_error(data: str) -> None:
+    server = Server(sse(*EVENTS[:3], tail=f"data: {data}\n\n"))
+    with pytest.raises(LlamaAPIError, match="stream event"):
+        list(make_llm(server).stream("hi"))
+
+
+def test_tool_call_without_function_is_invalid() -> None:
+    server = Server(reply_with({"role": "assistant", "tool_calls": [{"id": "c1"}]}))
+    msg = make_llm(server).invoke("x")
+    assert msg.tool_calls == []
+    assert msg.invalid_tool_calls == [
+        {
+            "type": "invalid_tool_call",
+            "name": None,
+            "args": None,
+            "id": "c1",
+            "error": "tool call has no 'function' object",
+        }
+    ]
+
+
+def test_v1_stream_tool_call_without_index_keeps_its_own_block() -> None:
+    # Core only joins indexed fragments, so an un-indexed call comes whole.
+    call = tool_call_delta(
+        0, call_id="call_1", name="magic_function", args='{"input": 3}'
+    )
+    del call["choices"][0]["delta"]["tool_calls"][0]["index"]
+    msg = stream_v1(
+        delta(reasoning_content="Use the tool."),
+        call,
+        delta(finish_reason="tool_calls"),
+    )
+    assert [block["type"] for block in msg.content_blocks] == [
+        "reasoning",
+        "tool_call",
+    ]
+    assert msg.content_blocks[1] == MAGIC_CALL

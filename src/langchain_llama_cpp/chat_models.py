@@ -4,6 +4,7 @@ import asyncio
 import json
 import random
 import time
+import weakref
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from operator import itemgetter
 from typing import Any, Literal, cast
@@ -34,6 +35,7 @@ from langchain_core.messages.ai import (
     UsageMetadata,
 )
 from langchain_core.messages.tool import ToolCallChunk
+from langchain_core.messages.tool import invalid_tool_call as create_invalid_tool_call
 from langchain_core.messages.tool import tool_call_chunk as create_tool_call_chunk
 from langchain_core.output_parsers import (
     JsonOutputKeyToolsParser,
@@ -67,12 +69,15 @@ from pydantic import BaseModel, Field, PrivateAttr
 
 from langchain_llama_cpp.content_blocks import MODEL_PROVIDER
 from langchain_llama_cpp.exceptions import (
+    error_from_cut_off_stream,
     error_from_response,
     error_from_stream_event,
     error_from_transport,
 )
 
 CHAT_COMPLETIONS = "/v1/chat/completions"
+
+_AsyncClients = weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient]
 
 
 # Backoff between retries, as in the openai and groq SDKs.
@@ -340,9 +345,9 @@ class ChatLlama(BaseChatModel):
 
     _client: httpx.Client | None = PrivateAttr(default=None)
     # An AsyncClient's pooled connections belong to the event loop that opened
-    # them, so the cached client is replaced when a call runs on another loop.
-    _async_client: httpx.AsyncClient | None = PrivateAttr(default=None)
-    _async_client_loop: asyncio.AbstractEventLoop | None = PrivateAttr(default=None)
+    # them, so there is one client per loop. Weak keys: a client goes away with
+    # its loop, and threads running their own loops don't evict each other.
+    _async_clients: _AsyncClients = PrivateAttr(default_factory=_AsyncClients)
 
     @property
     def _llm_type(self) -> str:
@@ -430,13 +435,15 @@ class ChatLlama(BaseChatModel):
                 if data is None:
                     continue
                 if data == "[DONE]":
-                    break
+                    return
                 if chunk := _convert_chunk(_sse_event(data, response)):
                     yield chunk
         except httpx.TransportError as exc:  # the connection broke mid-stream
             raise error_from_transport(exc) from exc
         finally:
             response.close()  # also when the caller stops early
+        # Only [DONE] returns early: the stream was cut off.
+        raise error_from_cut_off_stream(response)
 
     async def _astream(
         self,
@@ -455,13 +462,15 @@ class ChatLlama(BaseChatModel):
                 if data is None:
                     continue
                 if data == "[DONE]":
-                    break
+                    return
                 if chunk := _convert_chunk(_sse_event(data, response)):
                     yield chunk
         except httpx.TransportError as exc:
             raise error_from_transport(exc) from exc
         finally:
             await response.aclose()
+        # Only [DONE] returns early: the stream was cut off.
+        raise error_from_cut_off_stream(response)
 
     def get_server_defaults(self) -> dict[str, Any]:
         """Fetch the sampling defaults the server uses for this model.
@@ -617,7 +626,12 @@ class ChatLlama(BaseChatModel):
         llm: Runnable[LanguageModelInput, BaseMessage]
         output_parser: Runnable[Any, Any]
         if schema is not None and method == "function_calling":
-            tool = convert_to_openai_tool(schema, strict=strict)
+            given = _given_json_schema(schema)
+            tool = (
+                _tool_from_json_schema(given, strict=strict)
+                if given is not None
+                else convert_to_openai_tool(schema, strict=strict)
+            )
             # The caller's kwargs win over our defaults, as in ChatOpenAI.
             bind_kwargs: dict[str, Any] = {
                 "tool_choice": "required",
@@ -694,7 +708,8 @@ class ChatLlama(BaseChatModel):
             payload["stop"] = stop
         if streaming:
             # Chunks would interleave completions; ChatOpenAI refuses this too.
-            if (payload.get("n") or 1) > 1:
+            # `n_cmpl` is llama-server's alias for `n`.
+            if max(payload.get("n") or 1, payload.get("n_cmpl") or 1) > 1:
                 msg = "n must be 1 when streaming."
                 raise ValueError(msg)
             payload["stream"] = True
@@ -720,10 +735,11 @@ class ChatLlama(BaseChatModel):
         if self.http_async_client is not None:
             return self.http_async_client
         loop = asyncio.get_running_loop()
-        if self._async_client is None or self._async_client_loop is not loop:
-            self._async_client = httpx.AsyncClient(timeout=self.timeout)
-            self._async_client_loop = loop
-        return self._async_client
+        client = self._async_clients.get(loop)
+        if client is None:
+            client = httpx.AsyncClient(timeout=self.timeout)
+            self._async_clients[loop] = client
+        return client
 
     def _request(
         self, method: str, path: str, payload: dict[str, Any] | None = None
@@ -750,17 +766,18 @@ class ChatLlama(BaseChatModel):
             try:
                 response = client.send(request, stream=stream)
             except httpx.TransportError as exc:
-                error, cause, retry_after = error_from_transport(exc), exc, None
+                delay = self._retry_delay_or_raise(
+                    attempt, error_from_transport(exc), exc, None
+                )
             else:
                 if response.is_success:
                     return response
                 response.read()  # a streamed error body isn't read yet
                 response.close()
-                error, cause = error_from_response(response), None
-                retry_after = _retry_after(response)
-            if not _is_retryable(error) or attempt >= self.max_retries:
-                raise error from cause
-            time.sleep(_retry_delay(attempt, retry_after))
+                delay = self._retry_delay_or_raise(
+                    attempt, error_from_response(response), None, response
+                )
+            time.sleep(delay)
             attempt += 1
 
     async def _asend(
@@ -772,18 +789,35 @@ class ChatLlama(BaseChatModel):
             try:
                 response = await client.send(request, stream=stream)
             except httpx.TransportError as exc:
-                error, cause, retry_after = error_from_transport(exc), exc, None
+                delay = self._retry_delay_or_raise(
+                    attempt, error_from_transport(exc), exc, None
+                )
             else:
                 if response.is_success:
                     return response
                 await response.aread()
                 await response.aclose()
-                error, cause = error_from_response(response), None
-                retry_after = _retry_after(response)
-            if not _is_retryable(error) or attempt >= self.max_retries:
-                raise error from cause
-            await asyncio.sleep(_retry_delay(attempt, retry_after))
+                delay = self._retry_delay_or_raise(
+                    attempt, error_from_response(response), None, response
+                )
+            await asyncio.sleep(delay)
             attempt += 1
+
+    def _retry_delay_or_raise(
+        self,
+        attempt: int,
+        error: Exception,
+        cause: BaseException | None,
+        response: httpx.Response | None,
+    ) -> float:
+        """Seconds to wait before retrying `error`, or raise it if it's final.
+
+        `response` is the error response, for its `Retry-After` header.
+        """
+        if not _is_retryable(error) or attempt >= self.max_retries:
+            raise error from cause
+        retry_after = _retry_after(response) if response is not None else None
+        return _retry_delay(attempt, retry_after)
 
 
 # ChatLlama fields that configure the client rather than the request.
@@ -816,8 +850,19 @@ def _sse_data(line: str) -> str | None:
 
 
 def _sse_event(data: str, response: httpx.Response) -> dict[str, Any]:
-    """Decode one event. An `error` event (failure mid-stream) is raised."""
-    event: dict[str, Any] = json.loads(data)
+    """Decode one event. An `error` event (failure mid-stream) is raised.
+
+    So is data that isn't a JSON object, as an API error.
+    """
+    try:
+        event: object = json.loads(data)
+    except ValueError as exc:
+        detail = {"message": f"invalid JSON in stream event: {data[:200]!r}"}
+        raise error_from_stream_event(detail, response) from exc
+    if not isinstance(event, dict):
+        detail = {"message": f"stream event isn't a JSON object: {data[:200]!r}"}
+        raise error_from_stream_event(detail, response)
+    event = cast("dict[str, Any]", event)
     if "error" in event:
         raise error_from_stream_event(event["error"], response)
     return event
@@ -914,18 +959,49 @@ def _json_schema_response_format(
     return {"type": "json_schema", "json_schema": json_schema}
 
 
+def _tool_from_json_schema(
+    given: dict[str, Any], *, strict: bool | None
+) -> dict[str, Any]:
+    """An OpenAI tool from a `{name, description?, schema, strict?}` dict.
+
+    `convert_to_openai_tool` doesn't know this shape: it would keep the name
+    and drop the schema, leaving a tool without parameters.
+    """
+    function: dict[str, Any] = {"name": given["name"]}
+    if description := given.get("description"):
+        function["description"] = description
+    function["parameters"] = given["schema"]
+    if strict is None:
+        strict = given.get("strict")
+    if strict is not None:
+        function["strict"] = strict
+    return {"type": "function", "function": function}
+
+
 def _given_json_schema(schema: dict[str, Any] | type) -> dict[str, Any] | None:
     """The `{name, schema, ...}` part of a schema already in OpenAI's shape.
 
     Accepts the two shapes ChatOpenAI does: a whole `response_format`
     (`{"type": "json_schema", "json_schema": {...}}`) and its inner
     `{"name": ..., "schema": ...}`. Anything else returns None.
+
+    Raises:
+        ValueError: If a `response_format` has no `json_schema.schema` object.
     """
     if not isinstance(schema, dict):
         return None
-    if schema.get("type") == "json_schema" and isinstance(
-        inner := schema.get("json_schema"), dict
-    ):
+    if schema.get("type") == "json_schema":
+        inner: object = schema.get("json_schema")
+        if not (
+            isinstance(inner, dict)
+            and "name" in inner
+            and isinstance(cast("dict[str, Any]", inner).get("schema"), dict)
+        ):
+            msg = (
+                "a json_schema response_format needs "
+                '{"json_schema": {"name": ..., "schema": {...}}}'
+            )
+            raise ValueError(msg)
         return cast("dict[str, Any]", inner)
     if "name" in schema and isinstance(schema.get("schema"), dict):
         return schema
@@ -978,11 +1054,17 @@ def _convert_message(message: BaseMessage) -> dict[str, Any]:
         # Core leaves v1 reasoning blocks in `content`; send text as content and
         # reasoning as `reasoning_content` (M1-c: the chat template decides).
         converted["content"] = message.text
-        reasoning = "".join(
-            block.get("reasoning", "")
-            for block in message.content_blocks
-            if block["type"] == "reasoning"
-        )
+        if isinstance(message.content, str):
+            # No blocks to look through; this is where core's best-effort
+            # parsing finds reasoning for string content.
+            kwarg = message.additional_kwargs.get("reasoning_content")
+            reasoning = kwarg if isinstance(kwarg, str) else ""
+        else:
+            reasoning = "".join(
+                block.get("reasoning", "")
+                for block in message.content_blocks
+                if block["type"] == "reasoning"
+            )
         if reasoning:
             converted["reasoning_content"] = reasoning
     return converted
@@ -1031,6 +1113,16 @@ def _convert_response_message(message: Mapping[str, Any]) -> AIMessage:
     invalid_tool_calls: list[InvalidToolCall] = []
     raw_tool_calls: list[dict[str, Any]] = message.get("tool_calls") or []
     for raw in raw_tool_calls:
+        if not isinstance(raw.get("function"), dict):  # parse_tool_call drops these
+            invalid_tool_calls.append(
+                create_invalid_tool_call(
+                    name=None,
+                    args=None,
+                    id=raw.get("id"),
+                    error="tool call has no 'function' object",
+                )
+            )
+            continue
         try:
             parsed = parse_tool_call(raw, return_id=True)
         except OutputParserException as exc:  # arguments aren't valid JSON

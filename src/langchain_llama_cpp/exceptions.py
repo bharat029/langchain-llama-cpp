@@ -120,6 +120,16 @@ def error_from_stream_event(
     return _build_error(message, fields, status, response, fallback=LlamaAPIError)
 
 
+def error_from_cut_off_stream(response: httpx.Response) -> LlamaConnectionError:
+    """The error for a stream that ended without `data: [DONE]` or an error event.
+
+    llama-server always ends a finished stream with `[DONE]`, so the
+    connection was closed early (a crash, a restart, or a proxy in between).
+    """
+    message = f"Stream from {response.request.url} ended without data: [DONE]"
+    return LlamaConnectionError(message, request=response.request)
+
+
 def _build_error(
     message: str,
     detail: dict[str, Any],
