@@ -1272,6 +1272,20 @@ def test_async_client_is_replaced_on_a_new_event_loop() -> None:
     assert second is not first  # not carried over to a closed loop
 
 
+def test_async_clients_of_closed_loops_are_dropped() -> None:
+    llm = ChatLlama(model="gemma", base_url=BASE_URL)
+    # Kept alive here, as a client's pooled connections keep their loop alive.
+    loops: list[asyncio.AbstractEventLoop] = []
+
+    async def use_client() -> None:
+        loops.append(asyncio.get_running_loop())
+        llm._get_async_client()
+
+    for _ in range(5):
+        asyncio.run(use_client())
+    assert list(llm._async_clients) == [loops[-1]]
+
+
 class BrokenStream(httpx.SyncByteStream, httpx.AsyncByteStream):
     """One chunk, then the connection fails."""
 

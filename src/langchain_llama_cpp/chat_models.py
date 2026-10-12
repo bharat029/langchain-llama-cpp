@@ -345,8 +345,9 @@ class ChatLlama(BaseChatModel):
 
     _client: httpx.Client | None = PrivateAttr(default=None)
     # An AsyncClient's pooled connections belong to the event loop that opened
-    # them, so there is one client per loop. Weak keys: a client goes away with
-    # its loop, and threads running their own loops don't evict each other.
+    # them, so there is one client per loop (langchain-ai/langchain#35783 is
+    # this bug in ChatOpenAI). Threads running their own loops don't evict each
+    # other; clients of closed loops are dropped in `_get_async_client`.
     _async_clients: _AsyncClients = PrivateAttr(default_factory=_AsyncClients)
 
     @property
@@ -723,6 +724,11 @@ class ChatLlama(BaseChatModel):
         loop = asyncio.get_running_loop()
         client = self._async_clients.get(loop)
         if client is None:
+            # Pooled connections keep their loop alive, so a weak key never
+            # dies on its own: drop clients of loops that have closed (each
+            # asyncio.run). They can't be aclose()d without their loop.
+            for old_loop in [old for old in self._async_clients if old.is_closed()]:
+                del self._async_clients[old_loop]
             client = httpx.AsyncClient(timeout=self.timeout)
             self._async_clients[loop] = client
         return client
