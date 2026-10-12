@@ -39,10 +39,10 @@ from langchain_llama_cpp import ChatLlama
 llm = ChatLlama(model="gemma", max_tokens=2000)  # base_url from LLAMA_BASE_URL
 msg = llm.invoke("What is 17 * 23? Answer with the number only.")
 
-msg.content                                 # '391'
-msg.additional_kwargs["reasoning_content"]  # 'The user wants to know the product of 17 and 23...'
-msg.usage_metadata                          # {'input_tokens': 32, 'output_tokens': 223, ...}
-msg.response_metadata["timings"]            # {'prompt_n': 25, 'predicted_n': 223, 'predicted_per_second': 41.4, ...}
+msg.content  # '391'
+msg.additional_kwargs["reasoning_content"]  # 'The user wants to know the product...'
+msg.usage_metadata  # {'input_tokens': 32, 'output_tokens': 223, ...}
+msg.response_metadata["timings"]  # {'prompt_n': 25, 'predicted_n': 223, ...}
 ```
 
 Set `max_tokens` with room for thinking. Reasoning length varies from run to
