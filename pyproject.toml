@@ -3,6 +3,8 @@ name = "langchain-llama-cpp"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Bharathan Mudaliar", email = "vbharathan.2013@gmail.com" }
 ]
