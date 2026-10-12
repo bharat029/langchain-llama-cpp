@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.0  # no major-version tags after v7
         with:
           version: "0.12.5"
           python-version: "3.13"
@@ -38,7 +38,7 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.0  # no major-version tags after v7
         with:
           version: "0.12.5"
           python-version: ${{ matrix.python-version }}
@@ -55,7 +55,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.0  # no major-version tags after v7
         with:
           version: "0.12.5"
           python-version: "3.10"
