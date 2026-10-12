@@ -18,3 +18,6 @@ CLAUDE.local.md
 
 # Local experiments
 notebooks/
+
+# Claude's temporary files (scripts, logs), instead of the system Temp folder
+.scratch/
