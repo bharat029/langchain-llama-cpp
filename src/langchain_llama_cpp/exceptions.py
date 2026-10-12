@@ -93,10 +93,13 @@ def error_from_response(response: httpx.Response) -> httpx.HTTPStatusError:
         body: object = response.json()
     except ValueError:
         body = None
+
     raw_detail = _json_object(body).get("error")
     detail = cast("LlamaError", _json_object(raw_detail))
+
     reason = detail.get("message") or raw_detail or response.text
     message = f"HTTP {response.status_code} from {response.request.url}: {reason}"
+
     return _build_error(
         message,
         detail,
@@ -117,8 +120,10 @@ def error_from_stream_event(
     fields = cast("LlamaError", _json_object(detail))
     reason = fields.get("message") or detail or "error during streaming"
     message = f"Error during streaming from {response.request.url}: {reason}"
+
     code = fields.get("code")
     status = code if isinstance(code, int) else None
+
     return _build_error(message, fields, status, response, fallback=LlamaAPIError)
 
 
@@ -140,6 +145,7 @@ def error_from_transport(exc: httpx.TransportError) -> httpx.TransportError:
         request: httpx.Request | None = exc.request
     except RuntimeError:  # httpx raises this when no request is attached
         request = None
+
     cls = (
         LlamaTimeoutError
         if isinstance(exc, httpx.TimeoutException)
@@ -162,6 +168,7 @@ def _build_error(
     any other 4xx (invalid request), 5xx (API error), else `fallback`.
     """
     request = response.request
+
     if detail.get("type") == "exceed_context_size_error":
         return LlamaContextOverflowError(
             message,
@@ -170,6 +177,7 @@ def _build_error(
             n_prompt_tokens=detail.get("n_prompt_tokens"),
             n_ctx=detail.get("n_ctx"),
         )
+
     if status is None:
         cls = fallback
     elif status in _STATUS_ERRORS:
@@ -180,6 +188,7 @@ def _build_error(
         cls = LlamaAPIError
     else:
         cls = fallback
+
     return cls(message, request=request, response=response)
 
 

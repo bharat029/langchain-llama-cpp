@@ -457,6 +457,7 @@ class ChatLlama(BaseChatModel):
         """
         response = self._send("GET", f"/upstream/{self.model}/props")
         settings: dict[str, Any] = response.json()["default_generation_settings"]
+
         # Undo float32 noise: 0.949999988079071 -> 0.95.
         defaults = {
             key: float(f"{value:.7g}") if isinstance(value, float) else value
@@ -511,12 +512,14 @@ class ChatLlama(BaseChatModel):
         formatted_tools = [
             convert_to_openai_tool(tool, strict=strict) for tool in tools
         ]
+
         if tool_choice:  # None, False and "" leave it out, as in ChatOpenAI
             tool_names = [
                 tool["function"]["name"]
                 for tool in formatted_tools
                 if "function" in tool
             ]
+
             # llama-server takes only these strings. It turns the object form
             # into "auto" (b11429), so a named tool becomes "required".
             if tool_choice is True or tool_choice == "any":
@@ -539,6 +542,7 @@ class ChatLlama(BaseChatModel):
                     raise ValueError(msg)
                 tool_choice = "required"
             kwargs["tool_choice"] = tool_choice
+
         if parallel_tool_calls is not None:
             kwargs["parallel_tool_calls"] = parallel_tool_calls
         return self.bind(tools=formatted_tools, **kwargs)
@@ -614,15 +618,18 @@ class ChatLlama(BaseChatModel):
         if method == "function_calling" and "tools" in kwargs:
             msg = "with_structured_output binds the schema as the only tool"
             raise ValueError(msg)
+
         pydantic_schema = (
             cast("type[BaseModel]", schema)
             if isinstance(schema, type) and is_basemodel_subclass(schema)
             else None
         )
+
         ls_kwargs: dict[str, Any] = {"method": method}
         if method != "json_mode":
             ls_kwargs["strict"] = strict
         ls_format = {"kwargs": ls_kwargs, "schema": schema}
+
         llm: Runnable[LanguageModelInput, BaseMessage]
         output_parser: Runnable[Any, Any]
         if schema is not None and method == "function_calling":
@@ -632,6 +639,7 @@ class ChatLlama(BaseChatModel):
                 if given is not None
                 else convert_to_openai_tool(schema, strict=strict)
             )
+
             # The caller's kwargs win over our defaults, as in ChatOpenAI.
             bind_kwargs: dict[str, Any] = {
                 "tool_choice": "required",
@@ -640,6 +648,7 @@ class ChatLlama(BaseChatModel):
                 **kwargs,
             }
             llm = self.bind_tools([tool], **bind_kwargs)
+
             output_parser = (
                 PydanticToolsParser(tools=[pydantic_schema], first_tool_only=True)
                 if pydantic_schema
@@ -653,6 +662,7 @@ class ChatLlama(BaseChatModel):
                 if schema is not None and method == "json_schema"
                 else {"type": "json_object"}
             )
+
             llm = self.bind(
                 **{
                     "response_format": response_format,
@@ -660,6 +670,7 @@ class ChatLlama(BaseChatModel):
                     **kwargs,
                 }
             )
+
             if schema is not None and include_format_instructions:
                 instructions = _format_instructions(schema)
 
@@ -671,8 +682,10 @@ class ChatLlama(BaseChatModel):
                     Returns a new list; the caller's messages are left untouched.
                     """
                     messages = self._convert_input(model_input).to_messages()
+
                     if not (messages and isinstance(messages[0], SystemMessage)):
                         return [SystemMessage(content=instructions), *messages]
+
                     system = messages[0]
                     content: str | list[str | dict[str, Any]]
                     if isinstance(system.content, str):
@@ -680,10 +693,12 @@ class ChatLlama(BaseChatModel):
                     else:
                         text = {"type": "text", "text": instructions}
                         content = [*system.content, text]
+
                     update = {"content": content}
                     return [system.model_copy(update=update), *messages[1:]]
 
                 llm = RunnableLambda(add_format_instructions) | llm
+
             output_parser = (
                 PydanticOutputParser(pydantic_object=pydantic_schema)
                 if pydantic_schema
@@ -722,6 +737,7 @@ class ChatLlama(BaseChatModel):
                 continue
             _add_usage(token_usage, output.get("token_usage") or {})
             system_fingerprint = system_fingerprint or output.get("system_fingerprint")
+
         combined: dict[str, Any] = {
             "token_usage": token_usage,
             "model_name": self.model,
@@ -764,6 +780,7 @@ class ChatLlama(BaseChatModel):
         # Core calls run_manager.on_llm_new_token for each chunk itself.
         payload = self._build_payload(messages, stop, streaming=True, **kwargs)
         response = self._send("POST", CHAT_COMPLETIONS, payload, stream=True)
+
         try:
             for line in response.iter_lines():
                 chunk = _chunk_from_line(line, response)
@@ -775,6 +792,7 @@ class ChatLlama(BaseChatModel):
             raise error_from_transport(exc) from exc
         finally:
             response.close()  # also when the caller stops early
+
         # Only [DONE] returns early: the stream was cut off.
         raise error_from_cut_off_stream(response)
 
@@ -787,6 +805,7 @@ class ChatLlama(BaseChatModel):
     ) -> AsyncIterator[ChatGenerationChunk]:
         payload = self._build_payload(messages, stop, streaming=True, **kwargs)
         response = await self._asend("POST", CHAT_COMPLETIONS, payload, stream=True)
+
         try:
             async for line in response.aiter_lines():
                 chunk = _chunk_from_line(line, response)
@@ -798,6 +817,7 @@ class ChatLlama(BaseChatModel):
             raise error_from_transport(exc) from exc
         finally:
             await response.aclose()
+
         # Only [DONE] returns early: the stream was cut off.
         raise error_from_cut_off_stream(response)
 
@@ -814,12 +834,14 @@ class ChatLlama(BaseChatModel):
         stream_usage = kwargs.pop("stream_usage", self.stream_usage)
         # Core leaves `invoke(..., stream=True)` in kwargs; `streaming` decides.
         kwargs.pop("stream", None)
+
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [_convert_message(message) for message in messages],
             **self._params,
             **kwargs,
         }
+
         if stop is not None:
             payload["stop"] = stop
         if streaming:
@@ -828,9 +850,11 @@ class ChatLlama(BaseChatModel):
             if max(payload.get("n") or 1, payload.get("n_cmpl") or 1) > 1:
                 msg = "n must be 1 when streaming."
                 raise ValueError(msg)
+
             payload["stream"] = True
             if stream_usage:
                 payload["stream_options"] = {"include_usage": True}
+
         return payload
 
     def _build_request(
@@ -852,6 +876,7 @@ class ChatLlama(BaseChatModel):
     def _get_async_client(self) -> httpx.AsyncClient:
         if self.http_async_client is not None:
             return self.http_async_client
+
         loop = asyncio.get_running_loop()
         client = self._async_clients.get(loop)
         if client is None:
@@ -860,6 +885,7 @@ class ChatLlama(BaseChatModel):
             # asyncio.run). They can't be aclose()d without their loop.
             for old_loop in [old for old in self._async_clients if old.is_closed()]:
                 del self._async_clients[old_loop]
+
             client = httpx.AsyncClient(timeout=self.timeout)
             self._async_clients[loop] = client
         return client
@@ -880,6 +906,7 @@ class ChatLlama(BaseChatModel):
         client = self._get_client()
         request = self._build_request(method, path, payload)
         attempt = 0
+
         while True:
             try:
                 response = client.send(request, stream=stream)
@@ -890,11 +917,13 @@ class ChatLlama(BaseChatModel):
             else:
                 if response.is_success:
                     return response
+
                 response.read()  # a streamed error body isn't read yet
                 response.close()
                 delay = self._retry_delay_or_raise(
                     attempt, error_from_response(response)
                 )
+
             time.sleep(delay)
             attempt += 1
 
@@ -910,6 +939,7 @@ class ChatLlama(BaseChatModel):
         client = self._get_async_client()
         request = self._build_request(method, path, payload)
         attempt = 0
+
         while True:
             try:
                 response = await client.send(request, stream=stream)
@@ -920,11 +950,13 @@ class ChatLlama(BaseChatModel):
             else:
                 if response.is_success:
                     return response
+
                 await response.aread()
                 await response.aclose()
                 delay = self._retry_delay_or_raise(
                     attempt, error_from_response(response)
                 )
+
             await asyncio.sleep(delay)
             attempt += 1
 
@@ -940,6 +972,7 @@ class ChatLlama(BaseChatModel):
         retryable = isinstance(error, ModelError) and error.is_retryable
         if not retryable or attempt >= self.max_retries:
             raise error from cause
+
         if isinstance(error, httpx.HTTPStatusError):
             try:
                 retry_after = float(error.response.headers.get("retry-after", ""))
@@ -947,6 +980,7 @@ class ChatLlama(BaseChatModel):
                 retry_after = None
             if retry_after is not None and 0 <= retry_after <= MAX_RETRY_AFTER:
                 return retry_after
+
         delay = min(INITIAL_RETRY_DELAY * 2**attempt, MAX_RETRY_DELAY)
         return delay * (1 - 0.25 * random.random())  # noqa: S311 (jitter, not crypto)
 
@@ -977,10 +1011,12 @@ _REQUEST_FIELDS = tuple(request_field_names())  # fixed once the class exists
 def _convert_message(message: BaseMessage) -> dict[str, Any]:
     """Convert a message to the OpenAI shape llama-server expects."""
     converted = convert_to_openai_messages(message)
+
     if isinstance(message, AIMessage):
         # Core leaves v1 reasoning blocks in `content`; send text as content and
         # reasoning as `reasoning_content` (M1-c: the chat template decides).
         converted["content"] = message.text
+
         if isinstance(message.content, str):
             # No blocks to look through; this is where core's best-effort
             # parsing finds reasoning for string content.
@@ -992,8 +1028,10 @@ def _convert_message(message: BaseMessage) -> dict[str, Any]:
                 for block in message.content_blocks
                 if block["type"] == "reasoning"
             )
+
         if reasoning:
             converted["reasoning_content"] = reasoning
+
     return converted
 
 
@@ -1017,6 +1055,7 @@ def _json_schema_response_format(
         if description := function.get("description"):
             json_schema["description"] = description
         json_schema["schema"] = function["parameters"]
+
     if strict is not None:
         json_schema["strict"] = strict
     return {"type": "json_schema", "json_schema": json_schema}
@@ -1034,10 +1073,12 @@ def _tool_from_json_schema(
     if description := given.get("description"):
         function["description"] = description
     function["parameters"] = given["schema"]
+
     if strict is None:
         strict = given.get("strict")
     if strict is not None:
         function["strict"] = strict
+
     return {"type": "function", "function": function}
 
 
@@ -1053,6 +1094,7 @@ def _given_json_schema(schema: dict[str, Any] | type) -> dict[str, Any] | None:
     """
     if not isinstance(schema, dict):
         return None
+
     if schema.get("type") == "json_schema":
         inner: object = schema.get("json_schema")
         if not (
@@ -1066,6 +1108,7 @@ def _given_json_schema(schema: dict[str, Any] | type) -> dict[str, Any] | None:
             )
             raise ValueError(msg)
         return cast("dict[str, Any]", inner)
+
     if "name" in schema and isinstance(schema.get("schema"), dict):
         return schema
     return None
@@ -1081,10 +1124,12 @@ def _format_instructions(schema: dict[str, Any] | type) -> str:
     """
     if isinstance(schema, type) and is_basemodel_subclass(schema):
         return PydanticOutputParser(pydantic_object=schema).get_format_instructions()
+
     if (given := _given_json_schema(schema)) is not None:
         reduced = dict(given["schema"])
     else:
         reduced = convert_to_json_schema(schema)
+
     reduced.pop("title", None)
     reduced.pop("type", None)
     return JSON_FORMAT_INSTRUCTIONS.format(
@@ -1104,18 +1149,21 @@ def _create_chat_result(data: LlamaResponse) -> ChatResult:
         timings=data.get("timings"),
         model_provider=MODEL_PROVIDER,
     )
+
     generations: list[ChatGeneration] = []
     for choice in data.get("choices") or []:
         message = _convert_response_message(choice.get("message") or LlamaMessage())
         message.response_metadata = dict(response_metadata)
         if usage:
             message.usage_metadata = _create_usage_metadata(usage)
+
         generation_info: dict[str, Any] = {"finish_reason": choice.get("finish_reason")}
         if logprobs := choice.get("logprobs"):
             generation_info["logprobs"] = logprobs
         generations.append(
             ChatGeneration(message=message, generation_info=generation_info)
         )
+
     llm_output = {
         "token_usage": usage,
         "model_name": data.get("model"),
@@ -1129,6 +1177,7 @@ def _convert_response_message(message: LlamaMessage) -> AIMessage:
     additional_kwargs: dict[str, Any] = {}
     if reasoning := message.get("reasoning_content"):
         additional_kwargs["reasoning_content"] = reasoning
+
     tool_calls: list[ToolCall] = []
     invalid_tool_calls: list[InvalidToolCall] = []
     for raw in message.get("tool_calls") or []:
@@ -1142,6 +1191,7 @@ def _convert_response_message(message: LlamaMessage) -> AIMessage:
                 )
             )
             continue
+
         raw_dict = dict(raw)  # core's parsers take a plain dict
         try:
             parsed = parse_tool_call(raw_dict, return_id=True)
@@ -1150,6 +1200,7 @@ def _convert_response_message(message: LlamaMessage) -> AIMessage:
             continue
         if parsed is not None:  # with return_id, already a complete ToolCall
             tool_calls.append(cast("ToolCall", parsed))
+
     content = message.get("content") or ""
     return AIMessage(
         content=content if isinstance(content, str) else [dict(p) for p in content],
@@ -1168,14 +1219,18 @@ def _create_usage_metadata(usage: LlamaUsage) -> UsageMetadata:
     completion_details = (
         usage.get("completion_tokens_details") or LlamaCompletionTokensDetails()
     )
+
     cache_read = prompt_details.get("cached_tokens")
     reasoning = completion_details.get("reasoning_tokens")
+
     input_details = InputTokenDetails()
     if cache_read is not None:
         input_details["cache_read"] = cache_read
+
     output_details = OutputTokenDetails()
     if reasoning is not None:
         output_details["reasoning"] = reasoning
+
     return UsageMetadata(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
@@ -1213,14 +1268,17 @@ def _chunk_from_line(line: str, response: httpx.Response) -> ChatGenerationChunk
     data = line[len("data:") :].strip()
     if data == "[DONE]":
         return _DONE
+
     try:
         event: object = json.loads(data)
     except ValueError as exc:
         detail = {"message": f"invalid JSON in stream event: {data[:200]!r}"}
         raise error_from_stream_event(detail, response) from exc
+
     if not isinstance(event, dict):
         detail = {"message": f"stream event isn't a JSON object: {data[:200]!r}"}
         raise error_from_stream_event(detail, response)
+
     if "error" in event:
         raise error_from_stream_event(cast("dict[str, Any]", event)["error"], response)
     return _convert_chunk(cast("LlamaChunk", event))
@@ -1240,9 +1298,11 @@ def _convert_chunk(event: LlamaChunk) -> ChatGenerationChunk | None:
         timings = event.get("timings")
         if usage is None and timings is None:
             return None
+
         response_metadata: dict[str, Any] = {"model_provider": MODEL_PROVIDER}
         if timings is not None:
             response_metadata["timings"] = timings
+
         message = AIMessageChunk(
             content="",
             usage_metadata=_create_usage_metadata(usage) if usage else None,
@@ -1252,9 +1312,11 @@ def _convert_chunk(event: LlamaChunk) -> ChatGenerationChunk | None:
 
     choice = choices[0]
     delta = choice.get("delta") or LlamaDelta()
+
     additional_kwargs: dict[str, Any] = {}
     if reasoning := delta.get("reasoning_content"):
         additional_kwargs["reasoning_content"] = reasoning
+
     tool_call_chunks: list[ToolCallChunk] = []
     for raw in delta.get("tool_calls") or []:
         # The id and name arrive in the first fragment, the arguments in pieces.
@@ -1267,12 +1329,14 @@ def _convert_chunk(event: LlamaChunk) -> ChatGenerationChunk | None:
                 index=raw.get("index"),
             )
         )
+
     message = AIMessageChunk(
         content=delta.get("content") or "",
         additional_kwargs=additional_kwargs,
         tool_call_chunks=tool_call_chunks,
         response_metadata={"model_provider": MODEL_PROVIDER},
     )
+
     generation_info: dict[str, Any] = {}
     if finish_reason := choice.get("finish_reason"):
         generation_info = _without_none(
