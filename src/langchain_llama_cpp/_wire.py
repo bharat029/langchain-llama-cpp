@@ -67,6 +67,7 @@ class LlamaFunction(TypedDict, total=False):
     """
 
     name: str
+
     arguments: str
     """JSON text, not an object: `'{"city": "Paris"}'`."""
 
@@ -81,8 +82,11 @@ class LlamaToolCall(TypedDict, total=False):
 
     index: int
     """Which call a stream fragment belongs to (0, 1, ...). Stream only."""
+
     id: str
+
     type: Literal["function"]
+
     function: LlamaFunction
 
 
@@ -102,10 +106,13 @@ class LlamaMessage(TypedDict, total=False):
     """`choices[].message` in a reply. Always `role` and `content`."""
 
     role: Literal["assistant"]
+
     content: str | list[LlamaContentPart]
     """`""` when the model only called tools."""
+
     reasoning_content: str
     """The thinking, separate from `content`. Left out when there was none."""
+
     tool_calls: list[LlamaToolCall]
     """Left out when there were no calls."""
 
@@ -194,10 +201,14 @@ class LlamaUsage(TypedDict, total=False):
     """`usage`. b11429 always sends the four keys below except the last."""
 
     prompt_tokens: int
+
     completion_tokens: int
     """Includes thinking tokens."""
+
     total_tokens: int
+
     prompt_tokens_details: LlamaPromptTokensDetails
+
     completion_tokens_details: LlamaCompletionTokensDetails
 
 
@@ -209,17 +220,27 @@ class LlamaTimings(TypedDict, total=False):
 
     cache_n: int
     """Prompt tokens reused from the KV cache."""
+
     prompt_n: int
     """Prompt tokens processed for this request."""
+
     prompt_ms: float
+
     prompt_per_token_ms: float
+
     prompt_per_second: float
+
     predicted_n: int
     """Tokens generated, thinking included."""
+
     predicted_ms: float
+
     predicted_per_token_ms: float
+
     predicted_per_second: float
+
     draft_n: int
+
     draft_n_accepted: int
 
 
@@ -237,16 +258,23 @@ class LlamaResponse(TypedDict, total=False):
 
     id: str
     """`chatcmpl-...`."""
+
     object: Literal["chat.completion"]
+
     created: int
     """Unix time, in seconds."""
+
     model: str
     """The file llama-swap loaded, not the entry name that was requested."""
+
     system_fingerprint: str
     """The server build, e.g. `b11429-d81235049`."""
+
     choices: list[LlamaChoice]
     """One per completion: `n` of them."""
+
     usage: LlamaUsage
+
     timings: LlamaTimings
     """Sent when the slot recorded timings (in every reply seen so far)."""
 
@@ -279,7 +307,9 @@ class LlamaError(TypedDict, total=False):
     """
 
     code: int
+
     message: str
+
     type: Literal[
         "invalid_request_error",
         "authentication_error",
@@ -290,7 +320,9 @@ class LlamaError(TypedDict, total=False):
         "unavailable_error",
         "exceed_context_size_error",
     ]
+
     n_prompt_tokens: int
     """With `exceed_context_size_error`: tokens in the rejected prompt."""
+
     n_ctx: int
     """With `exceed_context_size_error`: the context window."""

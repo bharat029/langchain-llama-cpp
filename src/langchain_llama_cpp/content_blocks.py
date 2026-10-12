@@ -42,14 +42,17 @@ def translate_content(message: AIMessage) -> list[types.ContentBlock]:
         for key, value in message.response_metadata.items()
         if key != "model_provider"
     }
+
     return message.model_copy(update={"response_metadata": metadata}).content_blocks
 
 
 def translate_content_chunk(message: AIMessageChunk) -> list[types.ContentBlock]:
     """Blocks for a streamed chunk: core's, with tool-call chunks re-indexed."""
     blocks: list[dict[str, Any]] = [dict(block) for block in translate_content(message)]
+
     if message.tool_call_chunks and message.chunk_position != "last":
         blocks = [block for block in blocks if block["type"] not in _TOOL_CALL_TYPES]
+
         for position, chunk in enumerate(message.tool_call_chunks):
             # Without the server's index, the chunk's position stands in, so the
             # block never falls back to core's colliding counter.
@@ -63,6 +66,7 @@ def translate_content_chunk(message: AIMessageChunk) -> list[types.ContentBlock]
                     "index": f"lc_tc_{position if index is None else index}",
                 }
             )
+
     return blocks  # pyright: ignore[reportReturnType]
 
 
