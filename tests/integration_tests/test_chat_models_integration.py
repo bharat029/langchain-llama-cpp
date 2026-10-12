@@ -70,7 +70,22 @@ class TestGemmaThinking(ChatLlamaIntegrationTests):
     }
 
 
-class TestQwenNoThinking(ChatLlamaIntegrationTests):
+class QwenIntegrationTests(ChatLlamaIntegrationTests):
+    """qwen's chat handler lets text come before a forced tool call (#27217)."""
+
+    @pytest.mark.xfail(
+        reason=(
+            "llama.cpp #27217: under tool_choice='required' qwen's handler allows "
+            "text before the call and forbids stopping without one, so the model "
+            "sometimes writes the answer as text and loops to max_tokens with no "
+            "call (2 of 25 tries, 2026-10-12)."
+        )
+    )
+    def test_structured_output_optional_param(self, model: BaseChatModel) -> None:
+        super().test_structured_output_optional_param(model)
+
+
+class TestQwenNoThinking(QwenIntegrationTests):
     model_name = "qwen"
     extra_params = {
         "chat_template_kwargs": {"enable_thinking": False},
@@ -78,7 +93,7 @@ class TestQwenNoThinking(ChatLlamaIntegrationTests):
     }
 
 
-class TestQwenThinking(ChatLlamaIntegrationTests):
+class TestQwenThinking(QwenIntegrationTests):
     model_name = "qwen"
     extra_params = {
         "chat_template_kwargs": {"enable_thinking": True},
