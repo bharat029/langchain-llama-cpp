@@ -67,6 +67,16 @@ from langchain_core.utils.function_calling import (
 from langchain_core.utils.pydantic import is_basemodel_subclass
 from pydantic import BaseModel, Field, PrivateAttr
 
+from langchain_llama_cpp._wire import (
+    LlamaChunk,
+    LlamaCompletionTokensDetails,
+    LlamaDelta,
+    LlamaFunction,
+    LlamaMessage,
+    LlamaPromptTokensDetails,
+    LlamaResponse,
+    LlamaUsage,
+)
 from langchain_llama_cpp.content_blocks import MODEL_PROVIDER
 from langchain_llama_cpp.exceptions import (
     error_from_cut_off_stream,
@@ -680,7 +690,8 @@ class ChatLlama(BaseChatModel):
     ) -> ChatResult:
         payload = self._build_payload(messages, stop, **kwargs)
         response = self._send("POST", CHAT_COMPLETIONS, payload)
-        return _create_chat_result(response.json())
+        data: LlamaResponse = response.json()
+        return _create_chat_result(data)
 
     async def _agenerate(
         self,
@@ -691,7 +702,8 @@ class ChatLlama(BaseChatModel):
     ) -> ChatResult:
         payload = self._build_payload(messages, stop, **kwargs)
         response = await self._asend("POST", CHAT_COMPLETIONS, payload)
-        return _create_chat_result(response.json())
+        data: LlamaResponse = response.json()
+        return _create_chat_result(data)
 
     def _stream(
         self,
@@ -1103,7 +1115,7 @@ def _add_to_system_message(
 # --- Replies --------------------------------------------------------------
 
 
-def _create_chat_result(data: Mapping[str, Any]) -> ChatResult:
+def _create_chat_result(data: LlamaResponse) -> ChatResult:
     usage = data.get("usage")
     response_metadata = _without_none(
         model_name=data.get("model"),
@@ -1113,15 +1125,14 @@ def _create_chat_result(data: Mapping[str, Any]) -> ChatResult:
         model_provider=MODEL_PROVIDER,
     )
     generations: list[ChatGeneration] = []
-    choices: list[dict[str, Any]] = data.get("choices") or []
-    for choice in choices:
-        message = _convert_response_message(choice["message"])
+    for choice in data.get("choices") or []:
+        message = _convert_response_message(choice.get("message") or LlamaMessage())
         message.response_metadata = dict(response_metadata)
         if usage:
             message.usage_metadata = _create_usage_metadata(usage)
         generation_info: dict[str, Any] = {"finish_reason": choice.get("finish_reason")}
-        if choice.get("logprobs"):
-            generation_info["logprobs"] = choice["logprobs"]
+        if logprobs := choice.get("logprobs"):
+            generation_info["logprobs"] = logprobs
         generations.append(
             ChatGeneration(message=message, generation_info=generation_info)
         )
@@ -1134,14 +1145,13 @@ def _create_chat_result(data: Mapping[str, Any]) -> ChatResult:
     return ChatResult(generations=generations, llm_output=llm_output)
 
 
-def _convert_response_message(message: Mapping[str, Any]) -> AIMessage:
+def _convert_response_message(message: LlamaMessage) -> AIMessage:
     additional_kwargs: dict[str, Any] = {}
     if reasoning := message.get("reasoning_content"):
         additional_kwargs["reasoning_content"] = reasoning
     tool_calls: list[ToolCall] = []
     invalid_tool_calls: list[InvalidToolCall] = []
-    raw_tool_calls: list[dict[str, Any]] = message.get("tool_calls") or []
-    for raw in raw_tool_calls:
+    for raw in message.get("tool_calls") or []:
         if not isinstance(raw.get("function"), dict):  # parse_tool_call drops these
             invalid_tool_calls.append(
                 create_invalid_tool_call(
@@ -1152,30 +1162,34 @@ def _convert_response_message(message: Mapping[str, Any]) -> AIMessage:
                 )
             )
             continue
+        raw_dict = dict(raw)  # core's parsers take a plain dict
         try:
-            parsed = parse_tool_call(raw, return_id=True)
+            parsed = parse_tool_call(raw_dict, return_id=True)
         except OutputParserException as exc:  # arguments aren't valid JSON
-            invalid_tool_calls.append(make_invalid_tool_call(raw, str(exc)))
+            invalid_tool_calls.append(make_invalid_tool_call(raw_dict, str(exc)))
             continue
         if parsed is not None:  # with return_id, already a complete ToolCall
             tool_calls.append(cast("ToolCall", parsed))
+    content = message.get("content") or ""
     return AIMessage(
-        content=message.get("content") or "",
+        content=content if isinstance(content, str) else [dict(p) for p in content],
         additional_kwargs=additional_kwargs,
         tool_calls=tool_calls,
         invalid_tool_calls=invalid_tool_calls,
     )
 
 
-def _create_usage_metadata(usage: Mapping[str, Any]) -> UsageMetadata:
+def _create_usage_metadata(usage: LlamaUsage) -> UsageMetadata:
     """Map llama-server's `usage` the way ChatOpenAI does."""
-    input_tokens: int = usage.get("prompt_tokens") or 0
-    output_tokens: int = usage.get("completion_tokens") or 0
-    total_tokens: int | None = usage.get("total_tokens")
-    prompt_details: Mapping[str, Any] = usage.get("prompt_tokens_details") or {}
-    completion_details: Mapping[str, Any] = usage.get("completion_tokens_details") or {}
-    cache_read: int | None = prompt_details.get("cached_tokens")
-    reasoning: int | None = completion_details.get("reasoning_tokens")
+    input_tokens = usage.get("prompt_tokens") or 0
+    output_tokens = usage.get("completion_tokens") or 0
+    total_tokens = usage.get("total_tokens")
+    prompt_details = usage.get("prompt_tokens_details") or LlamaPromptTokensDetails()
+    completion_details = (
+        usage.get("completion_tokens_details") or LlamaCompletionTokensDetails()
+    )
+    cache_read = prompt_details.get("cached_tokens")
+    reasoning = completion_details.get("reasoning_tokens")
     input_details = InputTokenDetails()
     if cache_read is not None:
         input_details["cache_read"] = cache_read
@@ -1227,7 +1241,7 @@ def _sse_data(line: str) -> str | None:
     return line[len("data:") :].strip()
 
 
-def _sse_event(data: str, response: httpx.Response) -> dict[str, Any]:
+def _sse_event(data: str, response: httpx.Response) -> LlamaChunk:
     """Decode one event. An `error` event (failure mid-stream) is raised.
 
     So is data that isn't a JSON object, as an API error.
@@ -1240,20 +1254,19 @@ def _sse_event(data: str, response: httpx.Response) -> dict[str, Any]:
     if not isinstance(event, dict):
         detail = {"message": f"stream event isn't a JSON object: {data[:200]!r}"}
         raise error_from_stream_event(detail, response)
-    event = cast("dict[str, Any]", event)
     if "error" in event:
-        raise error_from_stream_event(event["error"], response)
-    return event
+        raise error_from_stream_event(cast("dict[str, Any]", event)["error"], response)
+    return cast("LlamaChunk", event)
 
 
-def _convert_chunk(event: Mapping[str, Any]) -> ChatGenerationChunk | None:
+def _convert_chunk(event: LlamaChunk) -> ChatGenerationChunk | None:
     """Convert one streamed `chat.completion.chunk` to a LangChain chunk.
 
     Core merges chunks by concatenating string metadata (except `model_provider`
     and `id`), so `finish_reason`, `model_name` and `system_fingerprint` go on
     the finish chunk only.
     """
-    choices: list[dict[str, Any]] = event.get("choices") or []
+    choices = event.get("choices") or []
     if not choices:
         # The last chunk with `stream_options.include_usage`: usage and timings.
         usage = event.get("usage")
@@ -1271,15 +1284,14 @@ def _convert_chunk(event: Mapping[str, Any]) -> ChatGenerationChunk | None:
         return ChatGenerationChunk(message=message)
 
     choice = choices[0]
-    delta: Mapping[str, Any] = choice.get("delta") or {}
+    delta = choice.get("delta") or LlamaDelta()
     additional_kwargs: dict[str, Any] = {}
     if reasoning := delta.get("reasoning_content"):
         additional_kwargs["reasoning_content"] = reasoning
-    raw_tool_calls: list[dict[str, Any]] = delta.get("tool_calls") or []
     tool_call_chunks: list[ToolCallChunk] = []
-    for raw in raw_tool_calls:
+    for raw in delta.get("tool_calls") or []:
         # The id and name arrive in the first fragment, the arguments in pieces.
-        function: Mapping[str, Any] = raw.get("function") or {}
+        function = raw.get("function") or LlamaFunction()
         tool_call_chunks.append(
             create_tool_call_chunk(
                 name=function.get("name"),

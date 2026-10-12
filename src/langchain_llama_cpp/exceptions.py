@@ -20,6 +20,8 @@ from langchain_core.exceptions import (
     ModelTimeoutError,
 )
 
+from langchain_llama_cpp._wire import LlamaError
+
 
 class LlamaContextOverflowError(httpx.HTTPStatusError, ContextOverflowError):
     """The prompt is longer than the server's context window (HTTP 400).
@@ -92,7 +94,7 @@ def error_from_response(response: httpx.Response) -> httpx.HTTPStatusError:
     except ValueError:
         body = None
     raw_detail = _json_object(body).get("error")
-    detail = _json_object(raw_detail)
+    detail = cast("LlamaError", _json_object(raw_detail))
     reason = detail.get("message") or raw_detail or response.text
     message = f"HTTP {response.status_code} from {response.request.url}: {reason}"
     return _build_error(
@@ -112,7 +114,7 @@ def error_from_stream_event(
     The HTTP status was already 200, so the class comes from the event's
     `type` and `code` (llama-server's `format_error_response`).
     """
-    fields = _json_object(detail)
+    fields = cast("LlamaError", _json_object(detail))
     reason = fields.get("message") or detail or "error during streaming"
     message = f"Error during streaming from {response.request.url}: {reason}"
     code = fields.get("code")
@@ -148,7 +150,7 @@ def error_from_transport(exc: httpx.TransportError) -> httpx.TransportError:
 
 def _build_error(
     message: str,
-    detail: dict[str, Any],
+    detail: LlamaError,
     status: int | None,
     response: httpx.Response,
     *,
