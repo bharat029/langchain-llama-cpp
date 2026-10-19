@@ -1,0 +1,42 @@
+name: Publish
+
+# Pushing a v* tag builds the package and uploads it to PyPI with trusted
+# publishing: PyPI accepts this repository's publish.yml in the `pypi`
+# environment, so no API token is stored anywhere. A manual run publishes the
+# version in pyproject.toml from the branch picked in the Actions tab.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build and publish to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/langchain-llama-cpp/
+    permissions:
+      contents: read
+      id-token: write  # the OIDC token PyPI checks
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0  # no major-version tags after v7
+        with:
+          version: "0.12.5"
+          python-version: "3.13"
+      - name: Check the tag matches the version in pyproject.toml
+        if: github.ref_type == 'tag'
+        run: test "v$(uv version --short)" = "$GITHUB_REF_NAME"
+      - run: uv sync --locked
+      - run: uv run --locked pytest tests/unit_tests
+      - run: uv build --no-sources
+      # Install the built wheel alone, without the project's dev environment.
+      - name: Import the built wheel
+        run: >-
+          uv run --isolated --no-project --with dist/*.whl
+          python -c "import langchain_llama_cpp"
+      - run: uv publish
